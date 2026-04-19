@@ -1,87 +1,122 @@
 //! Production logging system for RUBIX
 
-use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+pub mod alert;
+
+pub use alert::AlertLogger;
+
 use tracing_appender::non_blocking::WorkerGuard;
+use tracing_subscriber::{prelude::*, EnvFilter};
 use std::path::PathBuf;
 use std::fs;
 
+/// Holds the non-blocking writer guard.
+///
+/// **Must be held for the entire lifetime of the program.**
+/// Drop it (or let it go out of scope) and all buffered log lines are lost.
+///
+/// ```rust
+/// // In main():
+/// let _logger = logger::Logger::init()?;
+/// // _logger must stay alive until the end of main()
+/// ```
 pub struct Logger {
-    _guard: Option<WorkerGuard>,
+    _guard: WorkerGuard,
 }
 
 impl Logger {
+    /// Initialise file-based JSON logging to `/var/log/rubix/rubix.log`.
+    ///
+    /// Returns a `Logger` whose `WorkerGuard` **must** be bound to a variable
+    /// in `main()` so it is not dropped early.
     pub fn init() -> Result<Self, Box<dyn std::error::Error>> {
-        // Create log directory if it doesn't exist
         let log_dir = PathBuf::from("/var/log/rubix");
-        if !log_dir.exists() {
-            fs::create_dir_all(&log_dir)?;
-        }
-        
-        // Set log file path
-        let log_file = log_dir.join("rubix.log");
-        
-        // Create file appender with rotation
+        fs::create_dir_all(&log_dir)?;
+
+        // Rolling daily log: rubix.2025-01-01.log etc.
         let file_appender = tracing_appender::rolling::daily(&log_dir, "rubix.log");
         let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
-        
-        // Set up environment filter
+
         let filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("rubix=info,blocker=info,capture=warn"));
-        
-        // Configure subscriber with both file and console output
-        let subscriber = tracing_subscriber::fmt()
-            .with_env_filter(filter)
+
+        // JSON format — structured, SIEM-friendly
+        let file_layer = tracing_subscriber::fmt::layer()
+            .json()
             .with_target(true)
             .with_thread_ids(true)
             .with_file(true)
             .with_line_number(true)
-            .json()
-            .with_writer(non_blocking)
-            .finish();
-        
-        tracing::subscriber::set_global_default(subscriber)?;
-        
-        Ok(Self { _guard: Some(guard) })
+            .with_writer(non_blocking);
+
+        tracing_subscriber::registry()
+            .with(filter)
+            .with(file_layer)
+            .init();
+
+        // Eagerly init AlertLogger so permission errors surface immediately
+        AlertLogger::init()?;
+
+        tracing::info!("Logger initialised — writing to /var/log/rubix/rubix.log");
+
+        Ok(Self { _guard: guard })
     }
-    
+
+    /// Initialise console-only logging (human-readable).
+    /// Useful for local dev / `--debug` CLI flag.
     pub fn init_console() -> Result<(), Box<dyn std::error::Error>> {
         let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new("rubix=info"));
-        
+            .unwrap_or_else(|_| EnvFilter::new("rubix=debug"));
+
         tracing_subscriber::fmt()
             .with_env_filter(filter)
-            .with_target(false)
+            .with_target(true)
             .with_thread_ids(true)
+            .pretty()
             .init();
-        
+
         Ok(())
     }
-}
 
-#[macro_export]
-macro_rules! log_info {
-    ($($arg:tt)*) => {
-        tracing::info!($($arg)*)
-    };
-}
+    /// Initialise both file (JSON) and console (pretty) output simultaneously.
+    /// Useful for running interactively while still writing structured logs.
+    pub fn init_dual() -> Result<Self, Box<dyn std::error::Error>> {
+        let log_dir = PathBuf::from("/var/log/rubix");
+        fs::create_dir_all(&log_dir)?;
 
-#[macro_export]
-macro_rules! log_error {
-    ($($arg:tt)*) => {
-        tracing::error!($($arg)*)
-    };
-}
+        let file_appender = tracing_appender::rolling::daily(&log_dir, "rubix.log");
+        let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
 
-#[macro_export]
-macro_rules! log_warn {
-    ($($arg:tt)*) => {
-        tracing::warn!($($arg)*)
-    };
-}
+        let file_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("rubix=info,blocker=info,capture=warn"));
 
-#[macro_export]
-macro_rules! log_debug {
-    ($($arg:tt)*) => {
-        tracing::debug!($($arg)*)
-    };
+        let console_filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new("rubix=info"));
+
+        let file_layer = tracing_subscriber::fmt::layer()
+            .json()
+            .with_target(true)
+            .with_thread_ids(true)
+            .with_file(true)
+            .with_line_number(true)
+            .with_writer(non_blocking)
+            .with_filter(file_filter);
+
+        let console_layer = tracing_subscriber::fmt::layer()
+            .pretty()
+            .with_target(false)
+            .with_thread_ids(false)
+            .with_writer(std::io::stderr)
+            .with_filter(console_filter);
+
+        tracing_subscriber::registry()
+            .with(file_layer)
+            .with(console_layer)
+            .init();
+
+        AlertLogger::init()?;
+
+        tracing::info!("Logger initialised (dual: file + console)");
+
+        Ok(Self { _guard: guard })
+    }
 }

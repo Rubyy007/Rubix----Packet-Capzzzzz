@@ -3,6 +3,7 @@
 
 use std::net::IpAddr;
 use std::time::{Instant, SystemTime};
+use std::fmt;          // ← add this
 use serde::Serialize;
 
 #[derive(Debug, Clone, Serialize)]
@@ -44,26 +45,25 @@ impl Packet {
             payload: None,
         }
     }
-    
-    // FIXED: Get length BEFORE moving data
+
     pub fn with_payload(mut self, data: Vec<u8>) -> Self {
-        self.size = data.len();      // Get length first
-        self.payload = Some(data);   // Then move data
+        self.size = data.len();
+        self.payload = Some(data);
         self
     }
-    
+
     pub fn has_payload(&self) -> bool {
         self.payload.is_some()
     }
-    
+
     pub fn payload_len(&self) -> usize {
         self.payload.as_ref().map(|p| p.len()).unwrap_or(0)
     }
-    
+
     pub fn key(&self) -> String {
         format!("{}:{}->{}:{}", self.src_ip, self.src_port, self.dst_ip, self.dst_port)
     }
-    
+
     pub fn reverse_key(&self) -> String {
         format!("{}:{}->{}:{}", self.dst_ip, self.dst_port, self.src_ip, self.src_port)
     }
@@ -82,23 +82,35 @@ pub enum Protocol {
 impl Protocol {
     pub fn from_u8(value: u8) -> Self {
         match value {
-            6 => Protocol::Tcp,
+            6  => Protocol::Tcp,
             17 => Protocol::Udp,
-            1 => Protocol::Icmp,
+            1  => Protocol::Icmp,
             58 => Protocol::Icmpv6,
-            2 => Protocol::Igmp,
-            _ => Protocol::Other(value),
+            2  => Protocol::Igmp,
+            _  => Protocol::Other(value),
         }
     }
-    
+
     pub fn as_str(&self) -> &'static str {
         match self {
-            Protocol::Tcp => "TCP",
-            Protocol::Udp => "UDP",
-            Protocol::Icmp => "ICMP",
+            Protocol::Tcp    => "TCP",
+            Protocol::Udp    => "UDP",
+            Protocol::Icmp   => "ICMP",
             Protocol::Icmpv6 => "ICMPv6",
-            Protocol::Igmp => "IGMP",
+            Protocol::Igmp   => "IGMP",
             Protocol::Other(_) => "OTHER",
+        }
+    }
+}
+
+// ── Display impl ─────────────────────────────────────────────────────────────
+// Reuses as_str() so there's a single source of truth for protocol names.
+// The only special case is Other(n) where we want the raw number visible.
+impl fmt::Display for Protocol {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Protocol::Other(n) => write!(f, "PROTO({})", n),
+            _                  => f.write_str(self.as_str()),
         }
     }
 }
