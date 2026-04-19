@@ -1,0 +1,26 @@
+mode: Block
+capture_interface: auto
+promiscuous: true
+buffer_size_mb: 64
+timeout_ms: 10
+snaplen: 65535
+bpf_filter: "ip or ip6"
+
+fast_path:
+  enable_sampling: false
+  sampling_rate_high: 0.3
+  enable_aggregation: false
+  aggregation_window_ms: 1000
+
+blocking:
+  enabled: true              # <-- ADD THIS LINE
+  iptables_chain: RUBIX
+  block_timeout_seconds: 3600
+  default_action: drop
+
+logging:
+  level: info
+  file_path: /var/log/rubix/rubix.log
+  json_format: true
+  max_file_size_mb: 100
+  rotation_count: 5

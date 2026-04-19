@@ -1,11 +1,10 @@
 //! Core packet data structures for RUBIX
 //! Optimized for zero-copy and minimal memory footprint
 
-use std::net::{IpAddr, Ipv4Addr};
+use std::net::IpAddr;
 use std::time::{Instant, SystemTime};
-use serde::{Serialize, Deserialize};
+use serde::Serialize;
 
-// FIXED: Removed Deserialize derive, added manual Default impl
 #[derive(Debug, Clone, Serialize)]
 pub struct Packet {
     #[serde(skip)]
@@ -19,26 +18,58 @@ pub struct Packet {
     pub size: usize,
     pub flags: PacketFlags,
     pub ttl: Option<u8>,
+    pub payload: Option<Vec<u8>>,
 }
 
-impl Default for Packet {
-    fn default() -> Self {
+impl Packet {
+    pub fn new(
+        src_ip: IpAddr,
+        dst_ip: IpAddr,
+        src_port: u16,
+        dst_port: u16,
+        protocol: Protocol,
+        size: usize,
+    ) -> Self {
         Self {
             timestamp: Instant::now(),
             system_time: SystemTime::now(),
-            src_ip: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            dst_ip: IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)),
-            src_port: 0,
-            dst_port: 0,
-            protocol: Protocol::Tcp,
-            size: 0,
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            protocol,
+            size,
             flags: PacketFlags::default(),
             ttl: None,
+            payload: None,
         }
+    }
+    
+    // FIXED: Get length BEFORE moving data
+    pub fn with_payload(mut self, data: Vec<u8>) -> Self {
+        self.size = data.len();      // Get length first
+        self.payload = Some(data);   // Then move data
+        self
+    }
+    
+    pub fn has_payload(&self) -> bool {
+        self.payload.is_some()
+    }
+    
+    pub fn payload_len(&self) -> usize {
+        self.payload.as_ref().map(|p| p.len()).unwrap_or(0)
+    }
+    
+    pub fn key(&self) -> String {
+        format!("{}:{}->{}:{}", self.src_ip, self.src_port, self.dst_ip, self.dst_port)
+    }
+    
+    pub fn reverse_key(&self) -> String {
+        format!("{}:{}->{}:{}", self.dst_ip, self.dst_port, self.src_ip, self.src_port)
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize)]
 pub enum Protocol {
     Tcp,
     Udp,
@@ -72,7 +103,7 @@ impl Protocol {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct PacketFlags {
     pub syn: bool,
     pub ack: bool,
@@ -80,36 +111,4 @@ pub struct PacketFlags {
     pub rst: bool,
     pub psh: bool,
     pub urg: bool,
-}
-
-impl Packet {
-    pub fn new(
-        src_ip: IpAddr,
-        dst_ip: IpAddr,
-        src_port: u16,
-        dst_port: u16,
-        protocol: Protocol,
-        size: usize,
-    ) -> Self {
-        Self {
-            timestamp: Instant::now(),
-            system_time: SystemTime::now(),
-            src_ip,
-            dst_ip,
-            src_port,
-            dst_port,
-            protocol,
-            size,
-            flags: PacketFlags::default(),
-            ttl: None,
-        }
-    }
-    
-    pub fn key(&self) -> String {
-        format!("{}:{}->{}:{}", self.src_ip, self.src_port, self.dst_ip, self.dst_port)
-    }
-    
-    pub fn reverse_key(&self) -> String {
-        format!("{}:{}->{}:{}", self.dst_ip, self.dst_port, self.src_ip, self.src_port)
-    }
 }

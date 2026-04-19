@@ -1489,6 +1489,7 @@ dependencies = [
  "dashmap",
  "etherparse",
  "futures",
+ "ipnet",
  "libc",
  "metrics",
  "metrics-exporter-prometheus",

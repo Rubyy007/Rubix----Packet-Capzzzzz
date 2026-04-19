@@ -1,0 +1,66 @@
+# Rules are evaluated in order - first match wins
+# Place Allow rules BEFORE Block rules for local networks
+
+- id: "allow-local-network"
+  name: "Allow Local Network"
+  enabled: true
+  action: Allow
+  conditions:
+    dst_ips:
+      - "192.168.0.0/16"
+      - "10.0.0.0/8"
+      - "172.16.0.0/12"
+      - "127.0.0.0/8"
+      - "1.2.3.4"  # Test IP
+    src_ips: []  # Empty means any source
+    protocols: []  # Empty means any protocol
+
+- id: "block-malware-c2"
+  name: "Block Known Malware C2 Servers"
+  enabled: true
+  action: Block
+  conditions:
+    dst_ips:
+      - "185.230.125.100"
+      - "94.102.61.78"
+      - "45.155.205.233"
+    src_ips: []
+    protocols: []
+    dst_ports: []
+
+- id: "block-ransomware-ports"
+  name: "Block Ransomware Ports"
+  enabled: true
+  action: Block
+  conditions:
+    dst_ports:
+      - 445      # SMB
+      - 3389     # RDP
+    protocols:
+      - "tcp"
+    dst_ips: []
+    src_ips: []
+
+# Optional: Add more rules below
+- id: "block-ssh-bruteforce"
+  name: "Block SSH Brute Force"
+  enabled: false  # Disabled by default
+  action: Block
+  conditions:
+    dst_ports:
+      - 22
+    protocols:
+      - "tcp"
+    dst_ips: []
+
+- id: "block-dns-malware"
+  name: "Block Malicious DNS"
+  enabled: false
+  action: Block
+  conditions:
+    dst_ports:
+      - 53
+    protocols:
+      - "udp"
+    dst_ips:
+      - "8.8.8.8"  # Example - would block Google DNS
