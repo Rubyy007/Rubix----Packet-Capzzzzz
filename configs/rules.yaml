@@ -1,5 +1,5 @@
-# Rules are evaluated in order - first match wins
-# Place Allow rules BEFORE Block rules for local networks
+# RUBIX Rules — evaluated in order, first match wins
+# Place Allow rules BEFORE Block rules for local/trusted networks
 
 - id: "allow-local-network"
   name: "Allow Local Network"
@@ -11,9 +11,9 @@
       - "10.0.0.0/8"
       - "172.16.0.0/12"
       - "127.0.0.0/8"
-      - "1.2.3.4"  # Test IP
-    src_ips: []  # Empty means any source
-    protocols: []  # Empty means any protocol
+    src_ips: []
+    protocols: []
+    dst_ports: []
 
 - id: "block-malware-c2"
   name: "Block Known Malware C2 Servers"
@@ -34,17 +34,16 @@
   action: Block
   conditions:
     dst_ports:
-      - 445      # SMB
-      - 3389     # RDP
+      - 445    # SMB — primary ransomware propagation vector
+      - 3389   # RDP — brute force / lateral movement
     protocols:
       - "tcp"
     dst_ips: []
     src_ips: []
 
-# Optional: Add more rules below
 - id: "block-ssh-bruteforce"
   name: "Block SSH Brute Force"
-  enabled: false  # Disabled by default
+  enabled: false
   action: Block
   conditions:
     dst_ports:
@@ -52,9 +51,10 @@
     protocols:
       - "tcp"
     dst_ips: []
+    src_ips: []
 
-- id: "block-dns-malware"
-  name: "Block Malicious DNS"
+- id: "block-malicious-dns"
+  name: "Block Malicious DNS Servers"
   enabled: false
   action: Block
   conditions:
@@ -63,4 +63,5 @@
     protocols:
       - "udp"
     dst_ips:
-      - "8.8.8.8"  # Example - would block Google DNS
+      - "8.8.8.8"    # example only — remove or replace with actual malicious resolvers
+    src_ips: []

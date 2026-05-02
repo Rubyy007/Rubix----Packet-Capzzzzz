@@ -1,9 +1,11 @@
-//! Cache for blocked IPs to avoid repeated iptables calls
+// src/blocker/cache.rs
+//! In-memory cache for blocked IPs — avoids repeated kernel calls
+
+#![allow(dead_code)]
 
 use std::collections::HashSet;
 use std::net::IpAddr;
 use std::sync::RwLock;
-use std::time::{SystemTime, Duration};
 use tracing::debug;
 
 pub struct BlockCache {
@@ -18,48 +20,53 @@ impl BlockCache {
             max_size,
         }
     }
-    
+
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        match self.blocked_ips.read() {
-            Ok(guard) => guard.contains(ip),
-            Err(_) => false,
-        }
+        self.blocked_ips.read()
+            .map(|g| g.contains(ip))
+            .unwrap_or(false)
     }
-    
+
     pub fn insert(&self, ip: IpAddr) -> bool {
         match self.blocked_ips.write() {
             Ok(mut guard) => {
                 if guard.len() >= self.max_size {
-                    let to_remove: Vec<IpAddr> = guard.iter().take(self.max_size / 2).cloned().collect();
+                    let to_remove: Vec<IpAddr> = guard
+                        .iter()
+                        .take(self.max_size / 2)
+                        .cloned()
+                        .collect();
                     for ip in to_remove {
                         guard.remove(&ip);
                     }
+                    debug!("Block cache evicted {} entries", self.max_size / 2);
                 }
                 guard.insert(ip)
             }
             Err(_) => false,
         }
     }
-    
+
     pub fn remove(&self, ip: &IpAddr) -> bool {
-        match self.blocked_ips.write() {
-            Ok(mut guard) => guard.remove(ip),
-            Err(_) => false,
-        }
+        self.blocked_ips.write()
+            .map(|mut g| g.remove(ip))
+            .unwrap_or(false)
     }
-    
+
     pub fn clear(&self) {
-        match self.blocked_ips.write() {
-            Ok(mut guard) => guard.clear(),
-            Err(_) => {}
+        if let Ok(mut g) = self.blocked_ips.write() {
+            g.clear();
         }
         debug!("Block cache cleared");
     }
-    
+
     pub fn len(&self) -> usize {
-        match self.blocked_ips.read() {
-            Ok(guard) => guard.len(),
-            Err(_) => 0,
-        }
+        self.blocked_ips.read()
+            .map(|g| g.len())
+            .unwrap_or(0)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
     }
 }

@@ -1,10 +1,12 @@
-mode: Block
-capture_interface: auto
+# RUBIX Linux Configuration — overrides common config
+
+mode: "Block"
+capture_interface: "auto"
 promiscuous: true
 buffer_size_mb: 64
 timeout_ms: 10
 snaplen: 65535
-bpf_filter: "ip or ip6"
+bpf_filter: ~                  # null — auto-built from block list at startup
 
 fast_path:
   enable_sampling: false
@@ -13,14 +15,15 @@ fast_path:
   aggregation_window_ms: 1000
 
 blocking:
-  enabled: true              # <-- ADD THIS LINE
-  iptables_chain: RUBIX
+  enabled: true
+  iptables_chain: "RUBIX"
   block_timeout_seconds: 3600
-  default_action: drop
+  default_action: "drop"
+  auto_cleanup: true
 
 logging:
-  level: info
-  file_path: /var/log/rubix/rubix.log
+  level: "info"
+  file_path: "/var/log/rubix/rubix.log"
   json_format: true
   max_file_size_mb: 100
   rotation_count: 5

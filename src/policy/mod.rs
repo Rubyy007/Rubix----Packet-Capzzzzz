@@ -5,14 +5,13 @@ mod reloader;
 mod watcher;
 
 // Re-export from engine - RuleAction is defined in engine.rs
-pub use engine::{PolicyEngine, RuleAction, EngineStats};
+pub use engine::{PolicyEngine, RuleAction};
 pub use reloader::PolicyReloader;
 // pub use watcher::PolicyWatcher; // Uncomment when implemented
 
 // Shared types used across policy module
 use std::net::IpAddr;
 use ipnet::IpNet;
-use serde::{Deserialize, Serialize};
 
 /// IP address or network range
 #[derive(Debug, Clone)]

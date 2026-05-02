@@ -1,6 +1,6 @@
 //! Rule evaluation engine
 
-use super::{Rule, IpNetOrAddr};
+use super::Rule;
 use crate::types::Packet;
 use std::collections::HashSet;
 use std::net::IpAddr;

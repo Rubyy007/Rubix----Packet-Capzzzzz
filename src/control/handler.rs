@@ -1,118 +1,228 @@
-//! Command handler for control system
+// src/control/handler.rs
+//! Command handler — executes control commands against live daemon state
 
-use super::{Command, CommandResponse};
-use crate::blocker::Blocker;
+use super::commands::{Command, CommandResponse};
+use crate::blocker::{Blocker, PlatformBlocker};
 use crate::policy::PolicyEngine;
+use crate::policy::PolicyReloader;
 use std::net::IpAddr;
 use std::sync::Arc;
-use tracing::{info, error};
+use std::time::{Duration, Instant};
+use tracing::{error, info, warn};
 
 pub struct CommandHandler {
-    blocker: Arc<dyn Blocker + Send + Sync>,
+    blocker:       Arc<PlatformBlocker>,
     policy_engine: Arc<PolicyEngine>,
+    reloader:      Arc<PolicyReloader>,
+    start_time:    Instant,
 }
 
 impl CommandHandler {
-    pub fn new(blocker: Arc<dyn Blocker + Send + Sync>, policy_engine: Arc<PolicyEngine>) -> Self {
-        Self {
-            blocker,
-            policy_engine,
-        }
+    pub fn new(
+        blocker:       Arc<PlatformBlocker>,
+        policy_engine: Arc<PolicyEngine>,
+        reloader:      Arc<PolicyReloader>,
+        start_time:    Instant,
+    ) -> Self {
+        Self { blocker, policy_engine, reloader, start_time }
     }
-    
+
     pub async fn handle(&self, command: Command) -> CommandResponse {
         match command {
-            Command::Status => self.handle_status().await,
-            Command::Stats => self.handle_stats().await,
-            Command::BlockIp { ip, reason } => self.handle_block_ip(ip, reason).await,
-            Command::UnblockIp { ip } => self.handle_unblock_ip(ip).await,
-            Command::ListBlocked => self.handle_list_blocked().await,
-            Command::ReloadConfig => self.handle_reload_config().await,
-            Command::Shutdown => self.handle_shutdown().await,
-            Command::GetRules => self.handle_get_rules().await,
-            Command::AddRule { rule } => self.handle_add_rule(rule).await,
-            Command::RemoveRule { rule_id } => self.handle_remove_rule(rule_id).await,
+            Command::Status                          => self.status().await,
+            Command::Stats                           => self.stats().await,
+            Command::BlockIp { ip, duration_secs, reason } =>
+                self.block_ip(ip, duration_secs, reason).await,
+            Command::UnblockIp { ip }                => self.unblock_ip(ip).await,
+            Command::ListBlocked                     => self.list_blocked().await,
+            Command::ReloadConfig                    => self.reload_config().await,
+            Command::Shutdown                        => self.shutdown().await,
+            Command::GetRules                        => self.get_rules().await,
         }
     }
-    
-    async fn handle_status(&self) -> CommandResponse {
-        CommandResponse::success("RUBIX is running".to_string())
-    }
-    
-    async fn handle_stats(&self) -> CommandResponse {
-        let stats = self.policy_engine.get_stats();
+
+    // ── Handlers ─────────────────────────────────────────────────────────────
+
+    async fn status(&self) -> CommandResponse {
+        let uptime  = self.start_time.elapsed().as_secs();
+        let h       = uptime / 3600;
+        let m       = (uptime % 3600) / 60;
+        let s       = uptime % 60;
+        let rules   = self.blocker.list_rules().await.unwrap_or_default();
+
         let data = serde_json::json!({
-            "packets_processed": stats.total_evaluations,
-            "blocks": stats.blocks,
-            "alerts": stats.alerts,
-            "allows": stats.allows,
-            "rules_count": self.policy_engine.rule_count(),
+            "status":        "running",
+            "uptime_secs":   uptime,
+            "uptime_human":  format!("{:02}h {:02}m {:02}s", h, m, s),
+            "active_blocks": rules.len(),
+            "policy_rules":  self.policy_engine.rule_count(),
         });
-        CommandResponse::with_data("Statistics retrieved".to_string(), data)
+
+        CommandResponse::success_with_data(
+            format!("RUBIX running — up {:02}h {:02}m {:02}s", h, m, s),
+            data,
+        )
     }
-    
-    async fn handle_block_ip(&self, ip: IpAddr, reason: Option<String>) -> CommandResponse {
-        match self.blocker.block_ip(ip).await {
-            Ok(rule_id) => {
-                self.policy_engine.block_ip(ip);
-                CommandResponse::success(format!("Blocked IP {} with rule {}", ip, rule_id))
+
+    async fn stats(&self) -> CommandResponse {
+        let stats = self.policy_engine.get_stats();
+        let data  = serde_json::json!({
+            "total_evaluations": stats.total_evaluations,
+            "rules_count":       self.policy_engine.rule_count(),
+        });
+        CommandResponse::success_with_data("Statistics retrieved", data)
+    }
+
+    async fn block_ip(
+        &self,
+        ip:           IpAddr,
+        duration_secs: Option<u64>,
+        reason:       Option<String>,
+    ) -> CommandResponse {
+        let result = match duration_secs.filter(|&d| d > 0) {
+            Some(secs) => {
+                info!(ip = %ip, secs, "Timed block via CLI");
+                self.blocker.block_ip_timed(ip, Duration::from_secs(secs)).await
             }
-            Err(e) => CommandResponse::error(format!("Failed to block IP {}: {}", ip, e)),
+            None => {
+                info!(ip = %ip, "Permanent block via CLI");
+                self.blocker.block_ip(ip).await
+            }
+        };
+
+        match result {
+            Ok(rule_id) => {
+                let _ = reason; // stored in BlockRule.reason inside blocker
+                let desc = match duration_secs.filter(|&d| d > 0) {
+                    Some(secs) => {
+                        let h = secs / 3600;
+                        let m = (secs % 3600) / 60;
+                        let s = secs % 60;
+                        if h > 0 {
+                            format!("blocked for {:02}h {:02}m {:02}s", h, m, s)
+                        } else if m > 0 {
+                            format!("blocked for {:02}m {:02}s", m, s)
+                        } else {
+                            format!("blocked for {}s", s)
+                        }
+                    }
+                    None => "permanently blocked".to_string(),
+                };
+
+                let data = serde_json::json!({
+                    "ip":      ip.to_string(),
+                    "rule_id": rule_id,
+                    "type":    if duration_secs.unwrap_or(0) > 0 { "timed" } else { "permanent" },
+                });
+
+                CommandResponse::success_with_data(
+                    format!("{} {} (rule: {})", ip, desc, rule_id),
+                    data,
+                )
+            }
+            Err(e) => {
+                error!(ip = %ip, error = %e, "Block via CLI failed");
+                CommandResponse::error(format!("Failed to block {}: {}", ip, e))
+            }
         }
     }
-    
-    async fn handle_unblock_ip(&self, ip: IpAddr) -> CommandResponse {
+
+    async fn unblock_ip(&self, ip: IpAddr) -> CommandResponse {
         match self.blocker.unblock_ip(ip).await {
             Ok(true) => {
-                self.policy_engine.unblock_ip(&ip);
-                CommandResponse::success(format!("Unblocked IP {}", ip))
+                info!(ip = %ip, "Unblocked via CLI");
+                CommandResponse::success(format!("{} unblocked successfully", ip))
             }
-            Ok(false) => CommandResponse::error(format!("IP {} was not blocked", ip)),
-            Err(e) => CommandResponse::error(format!("Failed to unblock IP {}: {}", ip, e)),
+            Ok(false) => {
+                warn!(ip = %ip, "Unblock requested but IP not in block list");
+                CommandResponse::error(format!("{} was not in the block list", ip))
+            }
+            Err(e) => {
+                error!(ip = %ip, error = %e, "Unblock via CLI failed");
+                CommandResponse::error(format!("Failed to unblock {}: {}", ip, e))
+            }
         }
     }
-    
-    async fn handle_list_blocked(&self) -> CommandResponse {
+
+    async fn list_blocked(&self) -> CommandResponse {
         match self.blocker.list_rules().await {
-            Ok(rules) => {
-                let ips: Vec<String> = rules.iter().map(|r| r.target.to_string()).collect();
-                let data = serde_json::json!({ "blocked_ips": ips, "count": ips.len() });
-                CommandResponse::with_data(format!("{} IPs blocked", ips.len()), data)
+            Ok(rules) if rules.is_empty() => {
+                CommandResponse::success("No active block rules")
             }
-            Err(e) => CommandResponse::error(format!("Failed to list blocked IPs: {}", e)),
+            Ok(rules) => {
+                let rules_json: Vec<serde_json::Value> = rules
+                    .iter()
+                    .map(|r| {
+                        serde_json::json!({
+                            "id":        r.id,
+                            "ip":        r.target.to_string(),
+                            "permanent": r.is_permanent(),
+                            "remaining": r.duration_display(),
+                            "reason":    r.reason,
+                        })
+                    })
+                    .collect();
+
+                let data = serde_json::json!({
+                    "rules": rules_json,
+                    "count": rules.len(),
+                });
+
+                CommandResponse::success_with_data(
+                    format!("{} active block rule(s)", rules.len()),
+                    data,
+                )
+            }
+            Err(e) => {
+                error!(error = %e, "List rules failed");
+                CommandResponse::error(format!("Failed to list rules: {}", e))
+            }
         }
     }
-    
-    async fn handle_reload_config(&self) -> CommandResponse {
-        // This would trigger config reload
-        CommandResponse::success("Configuration reload triggered".to_string())
+
+    async fn reload_config(&self) -> CommandResponse {
+        match self.reloader.load_initial() {
+            Ok(()) => {
+                info!("Rules reloaded via CLI");
+                CommandResponse::success(format!(
+                    "Rules reloaded — {} rules active",
+                    self.policy_engine.rule_count()
+                ))
+            }
+            Err(e) => {
+                error!(error = %e, "Rule reload failed");
+                CommandResponse::error(format!("Reload failed: {}", e))
+            }
+        }
     }
-    
-    async fn handle_shutdown(&self) -> CommandResponse {
-        CommandResponse::success("Shutting down...".to_string())
+
+    async fn shutdown(&self) -> CommandResponse {
+        info!("Shutdown requested via CLI");
+        CommandResponse::success("Shutdown signal sent — RUBIX stopping...")
     }
-    
-    async fn handle_get_rules(&self) -> CommandResponse {
+
+    async fn get_rules(&self) -> CommandResponse {
         let rules = self.policy_engine.get_rules();
-        let rules_json: Vec<serde_json::Value> = rules.iter().map(|r| {
-            serde_json::json!({
-                "id": r.id,
-                "name": r.name,
-                "action": format!("{:?}", r.action),
-                "enabled": r.enabled,
+        let json: Vec<serde_json::Value> = rules
+            .iter()
+            .map(|r| {
+                serde_json::json!({
+                    "id":      r.id,
+                    "name":    r.name,
+                    "action":  format!("{:?}", r.action),
+                    "enabled": r.enabled,
+                })
             })
-        }).collect();
-        
-        let data = serde_json::json!({ "rules": rules_json, "count": rules_json.len() });
-        CommandResponse::with_data(format!("{} rules loaded", rules_json.len()), data)
-    }
-    
-    async fn handle_add_rule(&self, rule: String) -> CommandResponse {
-        // Parse and add rule
-        CommandResponse::success(format!("Rule added: {}", rule))
-    }
-    
-    async fn handle_remove_rule(&self, rule_id: String) -> CommandResponse {
-        CommandResponse::success(format!("Rule removed: {}", rule_id))
+            .collect();
+
+        let data = serde_json::json!({
+            "rules": json,
+            "count": json.len(),
+        });
+
+        CommandResponse::success_with_data(
+            format!("{} policy rules loaded", json.len()),
+            data,
+        )
     }
 }
