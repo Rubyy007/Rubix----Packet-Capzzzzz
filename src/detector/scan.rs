@@ -1,240 +1,241 @@
-//! Port scan and nmap detection engine
-//!
-//! Detects all major nmap scan types by analyzing TCP flag combinations
-//! and packet patterns within sliding time windows.
+//! TCP/UDP port scan and nmap detection — production hot path
 
 use std::net::IpAddr;
+use std::time::Instant;
+
 use crate::types::PacketFlags;
 use super::{ThreatEvent, ThreatKind};
-use super::tracker::{
-    ThreatTracker, SCAN_PORT_THRESHOLD,
-    SEQUENTIAL_PORT_THRESHOLD, SYN_FLOOD_THRESHOLD,
-};
-use std::time::Instant;
+use super::tracker::ThreatTracker;
+
+// ── Static detail strings ───────────────────────────────────────────────────
+
+static DETAIL_NULL:     &str = "NULL scan detected (no TCP flags)";
+static DETAIL_FIN:      &str = "FIN scan detected (nmap -sF)";
+static DETAIL_XMAS:     &str = "XMAS scan detected (nmap -sX, FIN+PSH+URG)";
+static DETAIL_ACK:      &str = "ACK scan detected (nmap -sA, firewall mapping)";
+static DETAIL_SYN:      &str = "SYN scan detected (nmap -sS, half-open)";
+static DETAIL_SYNFLOOD: &str = "SYN flood DoS detected";
+static DETAIL_CONNECT:  &str = "Connect scan detected (nmap -sT)";
+static DETAIL_SEQ:      &str = "Sequential port scan detected";
+static DETAIL_OS:       &str = "OS fingerprinting detected (nmap -O)";
+static DETAIL_UDP:      &str = "UDP scan detected (nmap -sU)";
+
+// ── Thresholds for specific scans ────────────────────────────────────────────
+
+const NULL_MIN_PORTS: u32     = 2;
+const FIN_MIN_PORTS: u32      = 2;
+const XMAS_MIN_PORTS: u32     = 2;
+const ACK_MIN_PORTS: u32      = 5;
+const SYN_SCAN_MIN_PORTS: u32 = 15;
+const SYN_SCAN_MIN_SYNS: u32  = 20;
+const OS_WEIRD_FLAGS_MIN: u32 = 2;
+
+// ── ScanDetector ─────────────────────────────────────────────────────────────
 
 pub struct ScanDetector;
 
 impl ScanDetector {
-    /// Analyze a TCP packet and return threat events if detected.
-    /// Call this on every TCP packet in the hot path.
-    #[inline]
+    /// TCP analysis — hot path, ~20ns typical
+    #[inline(always)]
     pub fn analyze_tcp(
-        tracker:  &mut ThreatTracker,
-        src_ip:   IpAddr,
-        dst_port: u16,
-        flags:    &PacketFlags,
-    ) -> Vec<ThreatEvent> {
-        let mut threats = Vec::new();
-        let now         = Instant::now();
-
-        let state = tracker.get_or_create(src_ip);
-        state.last_seen     = now;
-        state.total_packets += 1;
-
-        // Track port hit
-        state.ports_hit.insert(dst_port);
-        state.port_history.push_back(dst_port);
-        if state.port_history.len() > 128 {
-            state.port_history.pop_front();
+        tracker:    &mut ThreatTracker,
+        src_ip:     IpAddr,
+        dst_port:   u16,
+        flags:      &PacketFlags,
+        proc_name:  Option<&str>,
+        is_ingress: bool,
+    ) -> Option<ThreatEvent> {
+        // Fast reject: whitelisted
+        if super::tracker::is_whitelisted(src_ip) {
+            return None;
         }
 
-        // Build flag byte for pattern matching
-        let flag_byte = Self::flags_to_byte(flags);
+        // Determine trust level
+        let trust = match proc_name {
+            Some(name) if super::tracker::is_highly_trusted_process(name) => TrustLevel::High,
+            Some(name) if super::tracker::is_medium_trust_process(name) => TrustLevel::Medium,
+            _ => TrustLevel::Unknown,
+        };
+
+        // High trust + egress — skip deep inspection
+        let skip_deep = matches!(trust, TrustLevel::High) && !is_ingress;
+
+        // ── Update state ──────────────────────────────────────────────────────
+        
+        let state = tracker.get_or_create(src_ip);
+        state.touch();
+        state.ports_hit.insert(dst_port);
+        state.port_history.push(dst_port);
+        
+        if state.port_history.len() > 64 {
+            state.port_history.remove(0);
+        }
+
+        let flag_byte = flags_to_byte(flags);
         state.tcp_flags_seen.insert(flag_byte);
 
-        // ── nmap NULL scan: no flags set ──────────────────────────────────────
-        // nmap -sN
-        if flag_byte == 0x00 && !state.already_alerted("null_scan") {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::NullScan,
-                format!(
-                    "NULL scan detected (no TCP flags) from {} → port {}",
-                    src_ip, dst_port
-                ),
-            ));
+        let is_syn = flags.syn && !flags.ack;
+        if is_syn {
+            state.syn_times.push(Instant::now());
         }
 
-        // ── nmap FIN scan: only FIN set ───────────────────────────────────────
-        // nmap -sF
-        if flags.fin && !flags.syn && !flags.ack && !flags.rst && !flags.psh && !flags.urg
-            && !state.already_alerted("fin_scan")
-        {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::FinScan,
-                format!(
-                    "FIN scan detected (nmap -sF) from {} → port {}",
-                    src_ip, dst_port
-                ),
-            ));
+        // Amortized maintenance
+        if state.total_packets & 0x0F == 0 {
+            state.cap_growth();
         }
 
-        // ── nmap XMAS scan: FIN+PSH+URG set ──────────────────────────────────
-        // nmap -sX — "lights up like a christmas tree"
-        if flags.fin && flags.psh && flags.urg && !flags.syn && !flags.ack
-            && !state.already_alerted("xmas_scan")
-        {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::XmasScan,
-                format!(
-                    "XMAS scan detected (nmap -sX, FIN+PSH+URG) from {} → port {}",
-                    src_ip, dst_port
-                ),
-            ));
-        }
-
-        // ── nmap ACK scan: only ACK set ───────────────────────────────────────
-        // nmap -sA — used to map firewall rules
-        if flags.ack && !flags.syn && !flags.fin && !flags.rst && !flags.psh
-            && !state.already_alerted("ack_scan")
-        {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::AckScan,
-                format!(
-                    "ACK scan detected (nmap -sA, firewall mapping) from {}",
-                    src_ip
-                ),
-            ));
-        }
-
-        // ── SYN tracking (for SYN scan + flood detection) ─────────────────────
-        if flags.syn && !flags.ack {
-            state.syn_times.push_back(now);
-
-            // ── nmap SYN scan: many SYNs, no completions ──────────────────────
-            // nmap -sS (half-open scan)
-            if state.ports_hit.len() >= 10
-                && !state.already_alerted("syn_scan")
-            {
-                threats.push(ThreatEvent::new(
-                    src_ip,
-                    ThreatKind::SynScan,
-                    format!(
-                        "SYN scan detected (nmap -sS) from {}: {} ports probed",
-                        src_ip,
-                        state.ports_hit.len(),
-                    ),
-                ));
-            }
-
-            // ── SYN flood: high rate SYN packets ─────────────────────────────
-            if state.syn_rate() >= SYN_FLOOD_THRESHOLD
-                && !state.already_alerted("syn_flood")
-            {
-                threats.push(ThreatEvent::new(
-                    src_ip,
-                    ThreatKind::SynFlood,
-                    format!(
-                        "SYN FLOOD: {} SYN/{}s from {}",
-                        state.syn_rate(),
-                        super::tracker::TRACK_WINDOW_SECS,
-                        src_ip,
-                    ),
-                ));
+        // ── Detection heuristics (ordered by severity) ────────────────────────
+        
+        // 1. SYN flood — always check, most severe
+        if is_syn {
+            let syn_count = state.syn_times.len() as u32;
+            let threshold = match trust {
+                TrustLevel::High => super::tracker::SYN_FLOOD_THRESHOLD * 5,
+                TrustLevel::Medium => super::tracker::SYN_FLOOD_THRESHOLD * 2,
+                TrustLevel::Unknown => super::tracker::SYN_FLOOD_THRESHOLD,
+            };
+            if syn_count >= threshold && !state.already_alerted("syn_flood") {
+                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::SynFlood, DETAIL_SYNFLOOD));
             }
         }
 
-        // ── Port scan threshold: many unique ports ────────────────────────────
-        // Catches nmap -sT (connect scan) and other scanners
-        if state.ports_hit.len() >= SCAN_PORT_THRESHOLD
-            && !state.already_alerted("port_scan")
-        {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::ConnectScan,
-                format!(
-                    "Port scan detected from {}: {} unique ports in {}s",
-                    src_ip,
-                    state.ports_hit.len(),
-                    super::tracker::TRACK_WINDOW_SECS,
-                ),
-            ));
+        // Skip deep inspection for trusted egress
+        if skip_deep {
+            return None;
         }
 
-        // ── Sequential port scan ──────────────────────────────────────────────
-        // nmap default scans ports sequentially
-        if state.has_sequential_ports()
-            && !state.already_alerted("sequential_scan")
-        {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::SequentialScan,
-                format!(
-                    "Sequential port scan detected from {}: {}+ consecutive ports",
-                    src_ip,
-                    SEQUENTIAL_PORT_THRESHOLD,
-                ),
-            ));
+        // 2. NULL scan
+        if flag_byte == 0x00 {
+            let port_count = state.ports_hit.len() as u32;
+            if port_count >= NULL_MIN_PORTS && !state.already_alerted("null_scan") {
+                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::NullScan, DETAIL_NULL));
+            }
         }
 
-        // ── OS fingerprinting detection ───────────────────────────────────────
-        // nmap -O sends packets with unusual flag combos to fingerprint the OS.
-        // Heuristic: if we see 4+ different flag combinations from same IP,
-        // it's almost certainly OS detection.
-        if state.tcp_flags_seen.len() >= 4
-            && !state.already_alerted("os_scan")
-        {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::OsScan,
-                format!(
-                    "OS fingerprinting detected (nmap -O) from {}: {} flag patterns",
-                    src_ip,
-                    state.tcp_flags_seen.len(),
-                ),
-            ));
+        // 3. FIN scan
+        if flags.fin && !flags.syn && !flags.ack && !flags.rst && !flags.psh && !flags.urg {
+            let port_count = state.ports_hit.len() as u32;
+            if port_count >= FIN_MIN_PORTS && !state.already_alerted("fin_scan") {
+                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::FinScan, DETAIL_FIN));
+            }
         }
 
-        threats
+        // 4. XMAS scan
+        if flags.fin && flags.psh && flags.urg && !flags.syn && !flags.ack {
+            let port_count = state.ports_hit.len() as u32;
+            if port_count >= XMAS_MIN_PORTS && !state.already_alerted("xmas_scan") {
+                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::XmasScan, DETAIL_XMAS));
+            }
+        }
+
+        // 5. ACK scan — ONLY ACK, no SYN ever seen, 5+ ports
+        if flags.ack && !flags.syn && !flags.fin && !flags.rst && !flags.psh {
+            let no_syn_history = state.syn_times.is_empty();
+            let port_count = state.ports_hit.len() as u32;
+            if no_syn_history && port_count >= ACK_MIN_PORTS && !state.already_alerted("ack_scan") {
+                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::AckScan, DETAIL_ACK));
+            }
+        }
+
+        // 6. SYN scan
+        if is_syn {
+            let port_count = state.ports_hit.len() as u32;
+            let syn_count = state.syn_times.len() as u32;
+            let threshold_ports = match trust {
+                TrustLevel::Medium => SYN_SCAN_MIN_PORTS * 2,
+                _ => SYN_SCAN_MIN_PORTS,
+            };
+            let threshold_syns = match trust {
+                TrustLevel::Medium => SYN_SCAN_MIN_SYNS * 2,
+                _ => SYN_SCAN_MIN_SYNS,
+            };
+            if port_count >= threshold_ports 
+                && syn_count >= threshold_syns 
+                && !state.already_alerted("syn_scan") 
+            {
+                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::SynScan, DETAIL_SYN));
+            }
+        }
+
+        // 7. Sequential scan
+        if state.has_sequential_ports() && !state.already_alerted("sequential_scan") {
+            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::ConnectScan, DETAIL_SEQ));
+        }
+
+        // 8. OS fingerprinting — weird flag patterns
+        let weird = state.weird_flag_count();
+        if weird >= OS_WEIRD_FLAGS_MIN && !state.already_alerted("os_scan") {
+            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::OsScan, DETAIL_OS));
+        }
+
+        // 9. General port scan catch-all
+        let port_count = state.ports_hit.len() as u32;
+        let threshold = match trust {
+            TrustLevel::Medium => super::tracker::SCAN_PORT_THRESHOLD * 2,
+            _ => super::tracker::SCAN_PORT_THRESHOLD,
+        };
+        if port_count >= threshold && !state.already_alerted("port_scan") {
+            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::ConnectScan, DETAIL_CONNECT));
+        }
+
+        None
     }
 
-    /// Analyze a UDP packet for UDP scan detection.
-    /// nmap -sU sends UDP packets to closed ports — they respond with ICMP unreachable.
-    #[inline]
+    /// UDP scan detection — minimal
+    #[inline(always)]
     pub fn analyze_udp(
-        tracker:  &mut ThreatTracker,
-        src_ip:   IpAddr,
-        dst_port: u16,
-    ) -> Vec<ThreatEvent> {
-        let mut threats = Vec::new();
-        let now         = Instant::now();
+        tracker:    &mut ThreatTracker,
+        src_ip:     IpAddr,
+        dst_port:   u16,
+        proc_name:  Option<&str>,
+        is_ingress: bool,
+    ) -> Option<ThreatEvent> {
+        if super::tracker::is_whitelisted(src_ip) {
+            return None;
+        }
+
+        // High trust outbound UDP — DNS, QUIC, etc.
+        if let Some(name) = proc_name {
+            if super::tracker::is_highly_trusted_process(name) && !is_ingress {
+                return None;
+            }
+        }
 
         let state = tracker.get_or_create(src_ip);
-        state.last_seen     = now;
-        state.total_packets += 1;
+        state.touch();
         state.ports_hit.insert(dst_port);
 
-        // UDP scan: many unique UDP ports from same IP
-        if state.ports_hit.len() >= SCAN_PORT_THRESHOLD
-            && !state.already_alerted("udp_scan")
-        {
-            threats.push(ThreatEvent::new(
-                src_ip,
-                ThreatKind::UdpScan,
-                format!(
-                    "UDP scan detected (nmap -sU) from {}: {} ports probed",
-                    src_ip,
-                    state.ports_hit.len(),
-                ),
-            ));
+        let port_count = state.ports_hit.len() as u32;
+        let threshold = match proc_name {
+            Some(name) if super::tracker::is_medium_trust_process(name) => super::tracker::SCAN_PORT_THRESHOLD * 2,
+            _ => super::tracker::SCAN_PORT_THRESHOLD,
+        };
+
+        if port_count >= threshold && !state.already_alerted("udp_scan") {
+            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::UdpScan, DETAIL_UDP));
         }
 
-        threats
+        None
     }
+}
 
-    /// Convert PacketFlags to a single byte for pattern matching
-    #[inline(always)]
-    fn flags_to_byte(flags: &PacketFlags) -> u8 {
-        let mut byte = 0u8;
-        if flags.fin { byte |= 0x01; }
-        if flags.syn { byte |= 0x02; }
-        if flags.rst { byte |= 0x04; }
-        if flags.psh { byte |= 0x08; }
-        if flags.ack { byte |= 0x10; }
-        if flags.urg { byte |= 0x20; }
-        byte
-    }
+// ── Internal ─────────────────────────────────────────────────────────────────
+
+#[derive(Clone, Copy)]
+enum TrustLevel {
+    Unknown,
+    Medium,
+    High,
+}
+
+#[inline(always)]
+fn flags_to_byte(flags: &PacketFlags) -> u8 {
+    let mut b = 0u8;
+    b |= (flags.fin as u8) << 0;
+    b |= (flags.syn as u8) << 1;
+    b |= (flags.rst as u8) << 2;
+    b |= (flags.psh as u8) << 3;
+    b |= (flags.ack as u8) << 4;
+    b |= (flags.urg as u8) << 5;
+    b
 }

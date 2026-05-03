@@ -11,7 +11,7 @@ mod control;
 mod resolver;
 mod detector;
 
-use detector::{ScanDetector, PingDetector, ThreatTracker, ThreatEvent, Severity};
+use detector::{ScanDetector, PingDetector, ThreatTracker, ThreatEvent};
 use policy::{PolicyEngine, PolicyReloader, RuleAction};
 use config::loader::ConfigLoader;
 use blocker::{PlatformBlocker, Blocker};
@@ -37,8 +37,6 @@ const OS_NAME: &str = "linux";
 const OS_NAME: &str = "windows";
 
 // ── Per-process statistics ────────────────────────────────────────────────────
-// Rolling-window counters reset every render cycle.
-// Cumulative unique sets never reset — track all endpoints ever seen.
 #[derive(Clone)]
 struct ProcStats {
     name:        String,
@@ -46,7 +44,6 @@ struct ProcStats {
     bytes:       u64,
     blocked:     u64,
     alerted:     u64,
-    // Cumulative — never reset
     unique_dsts: HashSet<IpAddr>,
     unique_srcs: HashSet<IpAddr>,
     protocols:   HashSet<String>,
@@ -66,7 +63,6 @@ impl ProcStats {
         }
     }
 
-    /// Reset rolling-window counters — keep name + cumulative unique sets
     #[inline]
     fn reset_window(&mut self) {
         self.packets = 0;
@@ -77,9 +73,6 @@ impl ProcStats {
 }
 
 // ── Heartbeat ─────────────────────────────────────────────────────────────────
-// Rolling window of pps samples rendered as scrolling ASCII waveform.
-// Pure ASCII — works in cmd.exe, PowerShell, Windows Terminal.
-// Height levels (low → high): _  .  -  ^  |
 struct Heartbeat {
     samples:  Vec<f64>,
     capacity: usize,
@@ -135,10 +128,7 @@ impl Heartbeat {
 }
 
 // ── Top talkers table ─────────────────────────────────────────────────────────
-// Only shows processes with activity this window.
-// Sorted: blocked first, then alerted, then packet count.
 fn render_top_talkers(stats: &HashMap<u32, ProcStats>) {
-    // Filter: only show processes with packets OR block/alert events this window
     let mut top: Vec<_> = stats.iter()
         .filter(|(_, s)| s.packets > 0 || s.blocked > 0 || s.alerted > 0)
         .collect();
@@ -147,7 +137,6 @@ fn render_top_talkers(stats: &HashMap<u32, ProcStats>) {
         return;
     }
 
-    // Sort: threats first, then by traffic volume
     top.sort_by(|a, b| {
         b.1.blocked.cmp(&a.1.blocked)
             .then(b.1.alerted.cmp(&a.1.alerted))
@@ -174,7 +163,6 @@ fn render_top_talkers(stats: &HashMap<u32, ProcStats>) {
             format!("{}B", s.bytes)
         };
 
-        // Prefix ! on blocked/alerted counts so threats are instantly visible
         let blk_str = if s.blocked > 0 {
             format!("!{}", s.blocked)
         } else {
@@ -229,7 +217,6 @@ async fn wait_for_shutdown() {
 }
 
 // ── Extract malicious IPs from rules.yaml ─────────────────────────────────────
-// Only enabled Block rules with explicit IPs (no CIDR ranges).
 fn extract_malicious_ips_from_rules() -> Vec<String> {
     let rules_path = "configs/rules.yaml";
     let mut ips    = Vec::new();
@@ -437,15 +424,30 @@ pub async fn print_banner(
     println!();
 }
 
+// ── Helper: determine if packet is ingress ────────────────────────────────────
+#[inline(always)]
+fn is_ingress_packet(src_ip: IpAddr, dst_ip: IpAddr) -> bool {
+    // Ingress: destination is local (private/loopback), source is external
+    dst_ip.is_loopback() || is_private_ip(dst_ip) && !is_private_ip(src_ip)
+}
+
+#[inline(always)]
+fn is_private_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let octets = v4.octets();
+            octets[0] == 10
+                || (octets[0] == 172 && octets[1] >= 16 && octets[1] <= 31)
+                || (octets[0] == 192 && octets[1] == 168)
+        }
+        IpAddr::V6(_) => false, // IPv6 private ranges more complex, skip for now
+    }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    // _logger MUST be a named binding — anonymous `let _ =` drops WorkerGuard
-    // immediately and silently discards all buffered log lines.
     let _logger = logger::Logger::init_dual()?;
-
-    // Start 30-day log cleanup background task.
-    // MUST be called after tokio runtime has started (inside #[tokio::main]).
     _logger.start_cleanup_task();
 
     let start_time = std::time::Instant::now();
@@ -465,8 +467,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let rules_count = policy_engine.rule_count();
 
     // ── Kernel blocker ────────────────────────────────────────────────────────
-    // PlatformBlocker → LinuxBlocker on Linux, WindowsBlocker on Windows.
-    // main.rs never needs to know which one it is.
     let blocker       = Arc::new(PlatformBlocker::new());
     let malicious_ips = extract_malicious_ips_from_rules();
 
@@ -488,8 +488,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Process resolver ──────────────────────────────────────────────────────
-    // Lock-free hot path (~20ns per lookup).
-    // Background refresh every 1s — never blocks packet processing.
     let resolver = Arc::new(ProcessResolver::new());
     info!("Process resolver initialized");
 
@@ -517,7 +515,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.capture_interface.clone()
     };
 
-    // Resolve human-readable label — shows "Ethernet (Up)" not raw GUID
     let interface_label = CaptureFactory::list_interfaces()
         .ok()
         .and_then(|ifaces| {
@@ -556,9 +553,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     capture.start().await?;
 
     // ── Control server ────────────────────────────────────────────────────────
-    // Linux   → Unix socket /var/run/rubix.sock
-    // Windows → TCP loopback 127.0.0.1:9876
-    // Commands: rubix status / block / unblock / list / reload / rules / stop
     let ctrl_handler = Arc::new(CommandHandler::new(
         blocker.clone(),
         policy_engine.clone(),
@@ -586,13 +580,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_packet_count = 0u64;
     let mut last_top_render   = start_time;
 
-    // 30-sample rolling heartbeat waveform
     let mut heartbeat = Heartbeat::new(30);
-
-    // Per-process stats — pre-sized for typical workload (~50 active processes)
     let mut proc_stats: HashMap<u32, ProcStats> = HashMap::with_capacity(128);
 
-    // Threat detection
     let mut threat_tracker = ThreatTracker::new();
     let mut recent_threats: std::collections::VecDeque<ThreatEvent> =
         std::collections::VecDeque::with_capacity(50);
@@ -605,7 +595,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 packet_count += 1;
 
                 // ── HOT PATH: Process resolution (~20ns) ──────────────────────
-                // Try src (egress) first, then dst (ingress).
                 let proto = Protocol::from_str(&packet.protocol.to_string());
 
                 let proc_info = resolver.lookup(&FlowKey {
@@ -624,7 +613,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         .entry(info.pid)
                         .or_insert_with(|| ProcStats::new(info.name.clone()));
 
-                    // Refresh name if process restarted with same PID
                     if entry.name.is_empty() {
                         entry.name.clone_from(&info.name);
                     }
@@ -636,14 +624,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     entry.protocols.insert(packet.protocol.to_string());
                 }
 
-                // ── Threat detection ───────────────────────────────────────────────
-                let threats: Vec<ThreatEvent> = match packet.protocol {
+                // ── Threat detection ────────────────────────────────────────
+                // NEW API: single Option<ThreatEvent>, with proc_name and is_ingress
+                let proc_name = proc_info.as_ref().map(|p| p.name.as_str());
+                let is_ingress = is_ingress_packet(packet.src_ip, packet.dst_ip);
+
+                let threat: Option<ThreatEvent> = match packet.protocol {
                     crate::types::Protocol::Tcp => {
                         ScanDetector::analyze_tcp(
                             &mut threat_tracker,
                             packet.src_ip,
                             packet.dst_port,
                             &packet.flags,
+                            proc_name,
+                            is_ingress,
                         )
                     }
                     crate::types::Protocol::Udp => {
@@ -651,23 +645,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &mut threat_tracker,
                             packet.src_ip,
                             packet.dst_port,
+                            proc_name,
+                            is_ingress,
                         )
                     }
                     crate::types::Protocol::Icmp | crate::types::Protocol::Icmpv6 => {
-                        // Echo request = type 8 for ICMPv4, type 128 for ICMPv6
-                        // We treat all ICMP from external IPs as potential sweep
                         PingDetector::analyze(
                             &mut threat_tracker,
                             packet.src_ip,
                             true, // treat all ICMP as echo request for simplicity
+                            proc_name,
+                            is_ingress,
                         )
                     }
-                    _ => vec![],
+                    _ => None,
                 };
 
-                // ── Handle detected threats ────────────────────────────────────────
-                for threat in threats {
-                    // Print alert immediately — on new line so it doesn't corrupt heartbeat
+                // ── Handle detected threat ───────────────────────────────────
+                if let Some(threat) = threat {
                     println!(
                         "\n{} {} DETECTED: {} | src={} | {}",
                         threat.severity.icon(),
@@ -677,7 +672,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         threat.detail,
                     );
 
-                    // Log to alert file
                     AlertLogger::log_block(
                         &threat.src_ip.to_string(),
                         "local",
@@ -687,14 +681,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &format!("{}:{}", threat.kind.as_str(), threat.detail),
                     );
 
-                    // Store for dashboard
                     recent_threats.push_back(threat.clone());
                     if recent_threats.len() > 50 {
                         recent_threats.pop_front();
                     }
 
-                    // Increment alert counter so heartbeat shows [ALERTING]
                     alert_count += 1;
+
+                    // Update per-process alert counter
+                    if let Some(ref info) = proc_info {
+                        if let Some(s) = proc_stats.get_mut(&info.pid) {
+                            s.alerted += 1;
+                        }
+                    }
                 }
 
                 // Periodic eviction of stale tracker state
@@ -756,10 +755,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
 
                 // ── Stats / heartbeat ─────────────────────────────────────────
-                // Adaptive check interval:
-                //   < 1000 packets total → check every 50  (low pps, responsive)
-                //   ≥ 1000 packets total → check every 500 (high pps, efficient)
-                // Secondary gate: only redraw if ≥ 0.5s has elapsed.
                 let check_interval = if packet_count < 1000 { 50 } else { 500 };
 
                 if packet_count % check_interval == 0 {
@@ -780,8 +775,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let wave   = heartbeat.render();
                         let status = Heartbeat::status_label(block_count, alert_count);
 
-                        // \r   — move cursor to start of line
-                        // \x1B[2K — erase entire line (prevents bleed from longer prev lines)
                         print!(
                             "\r\x1B[2K{status} |{wave}| {pps:>5.0} pps | pkts:{pkts:>8} blk:{blk:>4} alrt:{alrt:>4} | avg:{avg:>5.0}",
                             status = status,
@@ -795,21 +788,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let _ = std::io::stdout().flush();
 
                         // ── Top talkers every 5s ──────────────────────────────
-                        // Guard: only render if processes with actual activity exist.
                         if now.duration_since(last_top_render).as_secs() >= 5
                             && proc_stats.values().any(|s| s.packets > 0)
                         {
-                            println!();  // Finish heartbeat line before table
+                            println!();
                             render_top_talkers(&proc_stats);
                             last_top_render = now;
 
-                            // Reset rolling-window counters, keep names + unique sets
                             for s in proc_stats.values_mut() {
                                 s.reset_window();
                             }
 
-                            // Prune stale processes — cap map at 64 entries
-                            // Keep any process that has unique endpoints (was ever active)
                             if proc_stats.len() > 64 {
                                 proc_stats.retain(|_, s| !s.unique_dsts.is_empty());
                             }
@@ -825,7 +814,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Ok(None) => {
                 let now = std::time::Instant::now();
 
-                // Update heartbeat baseline every 2s during quiet periods
                 if now.duration_since(last_stats_time).as_secs() >= 2 {
                     heartbeat.push(0.0);
 
@@ -848,7 +836,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = std::io::stdout().flush();
 
-                    // Render top talkers during quiet periods if due
                     if now.duration_since(last_top_render).as_secs() >= 5
                         && proc_stats.values().any(|s| s.packets > 0)
                     {
@@ -871,7 +858,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sleep(Duration::from_micros(100)).await;
             }
 
-            // ── 100ms timeout — loop back and check running flag ──────────────
+            // ── 100ms timeout ──────────────────────────────────────────────────
             Err(_) => {
                 continue;
             }
@@ -892,12 +879,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Give capture 2 seconds to drain cleanly
     if timeout(Duration::from_secs(2), capture.stop()).await.is_err() {
         warn!("Capture did not stop cleanly within 2 seconds");
     }
 
-    // Final process snapshot before exit
     if proc_stats.values().any(|s| !s.unique_dsts.is_empty()) {
         render_top_talkers(&proc_stats);
     }

@@ -17,6 +17,7 @@ name = "rubix-cli"
 path = "cli/main.rs"
 
 [dependencies]
+ipnetwork = "0.20"
 # ── Packet capture & parsing ──────────────────────────────────────────────────
 pcap = "1.3"
 etherparse = "0.15"
