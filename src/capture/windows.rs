@@ -1,5 +1,10 @@
 // src/capture/windows.rs
 //! Windows production packet capture using NPcap (libpcap-compatible API)
+//!
+//! Uses etherparse 0.15+ API:
+//!   - parsed.net              (was parsed.ip)
+//!   - NetHeaders::Ipv4        (was IpHeader::Version4)
+//!   - NetHeaders::Ipv6        (was IpHeader::Version6)
 
 use super::{CaptureBackend, CaptureConfig, CaptureError, CaptureStats};
 use crate::types::{Packet, Protocol};
@@ -12,51 +17,61 @@ use tokio::sync::Mutex;
 use tokio::task::spawn_blocking;
 use tracing::{debug, info};
 
+// ── Capture handle ────────────────────────────────────────────────────────────
+
 pub struct WindowsCapture {
-    config: CaptureConfig,
+    config:  CaptureConfig,
     capture: Arc<Mutex<Option<Capture<Active>>>>,
-    stats: Arc<CaptureStatsInternal>,
+    stats:   Arc<CaptureStatsInternal>,
     running: Arc<AtomicBool>,
 }
 
+// ── Internal stats (all atomic — hot path safe) ───────────────────────────────
+
 struct CaptureStatsInternal {
-    packets_received: AtomicU64,
-    packets_dropped: AtomicU64,
-    packets_filtered: AtomicU64,
-    bytes_received: AtomicU64,
-    current_second_packets: AtomicU64,
+    packets_received:        AtomicU64,
+    packets_dropped:         AtomicU64,
+    packets_filtered:        AtomicU64,
+    bytes_received:          AtomicU64,
+    current_second_packets:  AtomicU64,
 }
+
+impl CaptureStatsInternal {
+    fn new() -> Self {
+        Self {
+            packets_received:        AtomicU64::new(0),
+            packets_dropped:         AtomicU64::new(0),
+            packets_filtered:        AtomicU64::new(0),
+            bytes_received:          AtomicU64::new(0),
+            current_second_packets:  AtomicU64::new(0),
+        }
+    }
+}
+
+// ── Implementation ────────────────────────────────────────────────────────────
 
 impl WindowsCapture {
     pub fn new(config: CaptureConfig) -> Result<Self, CaptureError> {
-        // Validate the interface exists at construction time
         let device = Self::resolve_interface(&config.interface)?;
         info!("Initialising Windows capture on: {}", device.name);
 
         Ok(Self {
             config,
             capture: Arc::new(Mutex::new(None)),
-            stats: Arc::new(CaptureStatsInternal {
-                packets_received: AtomicU64::new(0),
-                packets_dropped: AtomicU64::new(0),
-                packets_filtered: AtomicU64::new(0),
-                bytes_received: AtomicU64::new(0),
-                current_second_packets: AtomicU64::new(0),
-            }),
+            stats:   Arc::new(CaptureStatsInternal::new()),
             running: Arc::new(AtomicBool::new(false)),
         })
     }
 
-    /// Resolve interface name to a pcap Device.
-    /// Accepts full NPcap device names (\Device\NPF_{GUID})
-    /// or "auto" to pick the best available interface.
+    // ── Interface resolution ──────────────────────────────────────────────────
+
+    /// Resolve interface name → pcap Device.
+    /// Accepts full NPcap device names (\Device\NPF_{GUID}) or "auto".
     fn resolve_interface(interface: &str) -> Result<Device, CaptureError> {
         let devices = Device::list()
             .map_err(|e| CaptureError::PcapError(e.to_string()))?;
 
         if interface == "auto" {
-            // Use the same scoring logic as CaptureFactory::auto_select_interface
-            // but inline here since we need a Device not just a name
             devices
                 .into_iter()
                 .find(|d| {
@@ -67,18 +82,22 @@ impl WindowsCapture {
                 })
                 .ok_or_else(|| {
                     CaptureError::InterfaceNotFound(
-                        "No suitable interface found".to_string()
+                        "No suitable interface found for auto-selection".to_string(),
                     )
                 })
         } else {
             devices
                 .into_iter()
                 .find(|d| d.name == interface)
-                .ok_or_else(|| CaptureError::InterfaceNotFound(interface.to_string()))
+                .ok_or_else(|| {
+                    CaptureError::InterfaceNotFound(interface.to_string())
+                })
         }
     }
 
-    /// Open and configure the pcap capture handle.
+    // ── Capture handle setup ──────────────────────────────────────────────────
+
+    /// Open and configure the pcap handle using settings from config.
     fn open_capture(&self, device: Device) -> Result<Capture<Active>, CaptureError> {
         let mut cap = Capture::from_device(device)
             .map_err(|e| CaptureError::PcapError(e.to_string()))?
@@ -91,7 +110,7 @@ impl WindowsCapture {
                 let msg = e.to_string();
                 if msg.contains("permission") || msg.contains("access") {
                     CaptureError::PermissionDenied(
-                        "Run as Administrator for packet capture".to_string()
+                        "Run as Administrator for packet capture".to_string(),
                     )
                 } else {
                     CaptureError::PcapError(msg)
@@ -107,45 +126,93 @@ impl WindowsCapture {
         Ok(cap)
     }
 
-    /// Parse raw packet bytes into a typed Packet struct.
-    /// Returns None if the packet is not IP or cannot be parsed.
+    // ── Packet parsing ────────────────────────────────────────────────────────
+
+    /// Parse raw Ethernet frame → typed Packet.
+    ///
+    /// FIX: All pattern bindings use `ref` to borrow instead of move,
+    /// allowing `parsed.net` and `parsed.transport` to be read multiple
+    /// times (once for IPs/ports, once for TTL/flags).
+    ///
+    /// Returns None for non-IP frames or malformed data.
     #[inline]
     fn parse_packet(data: &[u8]) -> Option<Packet> {
         let parsed = etherparse::PacketHeaders::from_ethernet_slice(data).ok()?;
 
-        let (src_ip, dst_ip) = match parsed.ip {
-            Some(etherparse::IpHeader::Version4(ip, _)) => (
+        // ── Network layer: extract IP addresses + TTL ─────────────────────────
+        // Use `ref` on all inner bindings so we don't move out of `parsed.net`.
+        let (src_ip, dst_ip, ttl) = match &parsed.net {
+            Some(etherparse::NetHeaders::Ipv4(ref ip, _)) => (
                 IpAddr::V4(Ipv4Addr::from(ip.source)),
                 IpAddr::V4(Ipv4Addr::from(ip.destination)),
+                Some(ip.time_to_live),
             ),
-            Some(etherparse::IpHeader::Version6(ip, _)) => (
+            Some(etherparse::NetHeaders::Ipv6(ref ip, _)) => (
                 IpAddr::V6(Ipv6Addr::from(ip.source)),
                 IpAddr::V6(Ipv6Addr::from(ip.destination)),
+                Some(ip.hop_limit),
             ),
-            None => return None,
+            // Non-IP frame (ARP, VLAN, etc.) — skip silently
+            _ => return None,
         };
 
-        let (src_port, dst_port, protocol) = match parsed.transport {
-            Some(etherparse::TransportHeader::Tcp(tcp)) => {
-                (tcp.source_port, tcp.destination_port, Protocol::Tcp)
-            }
-            Some(etherparse::TransportHeader::Udp(udp)) => {
-                (udp.source_port, udp.destination_port, Protocol::Udp)
-            }
-            Some(etherparse::TransportHeader::Icmpv4(_)) => {
-                (0, 0, Protocol::Icmp)
-            }
-            Some(etherparse::TransportHeader::Icmpv6(_)) => {
-                (0, 0, Protocol::Icmpv6)
-            }
+        // ── Transport layer: extract ports + protocol ─────────────────────────
+        // Use `ref` on all inner bindings so we don't move out of
+        // `parsed.transport` — we need it again below for TCP flags.
+        let (src_port, dst_port, protocol) = match &parsed.transport {
+            Some(etherparse::TransportHeader::Tcp(ref tcp)) => (
+                tcp.source_port,
+                tcp.destination_port,
+                Protocol::Tcp,
+            ),
+            Some(etherparse::TransportHeader::Udp(ref udp)) => (
+                udp.source_port,
+                udp.destination_port,
+                Protocol::Udp,
+            ),
+            Some(etherparse::TransportHeader::Icmpv4(_)) => (
+                0,
+                0,
+                Protocol::Icmp,
+            ),
+            Some(etherparse::TransportHeader::Icmpv6(_)) => (
+                0,
+                0,
+                Protocol::Icmpv6,
+            ),
+            // Unknown or missing transport
             _ => (0, 0, Protocol::Other(0)),
         };
 
-        Some(Packet::new(
-            src_ip, dst_ip, src_port, dst_port, protocol, data.len(),
-        ))
+        // ── Assemble Packet ───────────────────────────────────────────────────
+        let mut pkt = Packet::new(
+            src_ip,
+            dst_ip,
+            src_port,
+            dst_port,
+            protocol,
+            data.len(),
+        );
+
+        // Populate TTL (safe: extracted by ref above, no move)
+        pkt.ttl = ttl;
+
+        // ── TCP flags ─────────────────────────────────────────────────────────
+        // Second read of parsed.transport — safe because we used `ref` above.
+        if let Some(etherparse::TransportHeader::Tcp(ref tcp)) = parsed.transport {
+            pkt.flags.syn = tcp.syn;
+            pkt.flags.ack = tcp.ack;
+            pkt.flags.fin = tcp.fin;
+            pkt.flags.rst = tcp.rst;
+            pkt.flags.psh = tcp.psh;
+            pkt.flags.urg = tcp.urg;
+        }
+
+        Some(pkt)
     }
 }
+
+// ── CaptureBackend trait implementation ───────────────────────────────────────
 
 #[async_trait]
 impl CaptureBackend for WindowsCapture {
@@ -155,7 +222,7 @@ impl CaptureBackend for WindowsCapture {
         }
 
         let device = Self::resolve_interface(&self.config.interface)?;
-        let cap = self.open_capture(device)?;
+        let cap    = self.open_capture(device)?;
 
         {
             let mut guard = self.capture.lock().await;
@@ -164,12 +231,16 @@ impl CaptureBackend for WindowsCapture {
 
         self.running.store(true, Ordering::SeqCst);
 
-        // Background task: reset per-second counter every second for pps stats
-        let stats = self.stats.clone();
+        // ── Per-second packet counter reset ───────────────────────────────────
+        // Background task resets current_second_packets every 1s so the
+        // main loop can compute a live pps figure cheaply.
+        let stats   = self.stats.clone();
         let running = self.running.clone();
+
         tokio::spawn(async move {
             let mut interval =
                 tokio::time::interval(std::time::Duration::from_secs(1));
+
             while running.load(Ordering::Relaxed) {
                 interval.tick().await;
                 stats.current_second_packets.store(0, Ordering::Relaxed);
@@ -187,10 +258,11 @@ impl CaptureBackend for WindowsCapture {
 
         self.running.store(false, Ordering::SeqCst);
 
+        // Dropping Capture closes the pcap device handle
         let mut guard = self.capture.lock().await;
-        *guard = None; // Drops the Capture handle, closing the device
+        *guard = None;
 
-        info!("Packet capture stopped");
+        info!("Packet capture stopped on {}", self.config.interface);
         Ok(())
     }
 
@@ -200,26 +272,29 @@ impl CaptureBackend for WindowsCapture {
         }
 
         let capture = self.capture.clone();
-        let stats = self.stats.clone();
+        let stats   = self.stats.clone();
 
-        // pcap's next_packet() is blocking — run it on the blocking thread pool
-        // so it doesn't stall the async runtime
+        // pcap::next_packet() is blocking — run on blocking thread pool
+        // so async runtime workers are never stalled waiting on I/O.
         let raw = spawn_blocking(move || {
             let mut guard = capture.blocking_lock();
-            let cap = guard.as_mut()?;
+            let cap       = guard.as_mut()?;
 
             match cap.next_packet() {
                 Ok(packet) => {
                     let len = packet.data.len() as u64;
-                    stats.packets_received.fetch_add(1, Ordering::Relaxed);
-                    stats.bytes_received.fetch_add(len, Ordering::Relaxed);
-                    stats.current_second_packets.fetch_add(1, Ordering::Relaxed);
+                    stats.packets_received      .fetch_add(1,   Ordering::Relaxed);
+                    stats.bytes_received        .fetch_add(len, Ordering::Relaxed);
+                    stats.current_second_packets.fetch_add(1,   Ordering::Relaxed);
                     Some(packet.data.to_vec())
                 }
-                Err(pcap::Error::TimeoutExpired) => None,
+                Err(pcap::Error::TimeoutExpired) => {
+                    // Normal — no packet arrived within the timeout window
+                    None
+                }
                 Err(e) => {
                     stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    debug!("Capture error: {}", e);
+                    debug!("Capture read error: {}", e);
                     None
                 }
             }
@@ -227,17 +302,26 @@ impl CaptureBackend for WindowsCapture {
         .await
         .ok()??;
 
-        Self::parse_packet(&raw)
+        // Parse on calling thread — pure memory ops, no I/O, very cheap
+        match Self::parse_packet(&raw) {
+            Some(pkt) => Some(pkt),
+            None => {
+                // Valid frame but not IP (ARP etc.) — count as filtered
+                self.stats.packets_filtered.fetch_add(1, Ordering::Relaxed);
+                None
+            }
+        }
     }
 
     fn stats(&self) -> CaptureStats {
         let pps = self.stats.current_second_packets.load(Ordering::Relaxed);
+
         CaptureStats {
-            packets_received: self.stats.packets_received.load(Ordering::Relaxed),
-            packets_dropped: self.stats.packets_dropped.load(Ordering::Relaxed),
-            packets_filtered: self.stats.packets_filtered.load(Ordering::Relaxed),
-            bytes_received: self.stats.bytes_received.load(Ordering::Relaxed),
-            // Rough estimate: pps × avg_frame_size × bits_per_byte / bits_per_megabit
+            packets_received:     self.stats.packets_received.load(Ordering::Relaxed),
+            packets_dropped:      self.stats.packets_dropped .load(Ordering::Relaxed),
+            packets_filtered:     self.stats.packets_filtered.load(Ordering::Relaxed),
+            bytes_received:       self.stats.bytes_received  .load(Ordering::Relaxed),
+            // pps × avg_frame_size(1500B) × 8 bits ÷ 1_000_000 bps_per_mbps
             interface_speed_mbps: pps.saturating_mul(1500 * 8) / 1_000_000,
         }
     }

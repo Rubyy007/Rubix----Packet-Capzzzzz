@@ -1,5 +1,5 @@
 // src/main.rs
-//! RUBIX - Production Network Blocking Engine with Kernel Blocking
+//! RUBIX - Production Network Blocking Engine with Process Attribution
 
 mod types;
 mod capture;
@@ -8,6 +8,7 @@ mod config;
 mod blocker;
 mod logger;
 mod control;
+mod resolver;
 
 use policy::{PolicyEngine, PolicyReloader, RuleAction};
 use config::loader::ConfigLoader;
@@ -16,10 +17,12 @@ use capture::{CaptureConfig, CaptureFactory};
 use capture::filter::FilterBuilder;
 use logger::AlertLogger;
 use control::{CommandHandler, ControlServer};
+use resolver::{ProcessResolver, FlowKey, Protocol};
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::net::IpAddr;
+use std::collections::{HashMap, HashSet};
 use tokio::time::{Duration, timeout, sleep};
 use tracing::{info, warn, error};
 use std::io::Write;
@@ -31,16 +34,50 @@ const OS_NAME: &str = "linux";
 #[cfg(target_os = "windows")]
 const OS_NAME: &str = "windows";
 
+// ── Per-process statistics ────────────────────────────────────────────────────
+// Rolling-window counters reset every render cycle.
+// Cumulative unique sets never reset — track all endpoints ever seen.
+#[derive(Clone)]
+struct ProcStats {
+    name:        String,
+    packets:     u64,
+    bytes:       u64,
+    blocked:     u64,
+    alerted:     u64,
+    // Cumulative — never reset
+    unique_dsts: HashSet<IpAddr>,
+    unique_srcs: HashSet<IpAddr>,
+    protocols:   HashSet<String>,
+}
+
+impl ProcStats {
+    fn new(name: String) -> Self {
+        Self {
+            name,
+            packets:     0,
+            bytes:       0,
+            blocked:     0,
+            alerted:     0,
+            unique_dsts: HashSet::with_capacity(16),
+            unique_srcs: HashSet::with_capacity(16),
+            protocols:   HashSet::with_capacity(4),
+        }
+    }
+
+    /// Reset rolling-window counters — keep name + cumulative unique sets
+    #[inline]
+    fn reset_window(&mut self) {
+        self.packets = 0;
+        self.bytes   = 0;
+        self.blocked = 0;
+        self.alerted = 0;
+    }
+}
+
 // ── Heartbeat ─────────────────────────────────────────────────────────────────
-// Rolling window of pps samples rendered as a scrolling ASCII waveform.
-// Uses only basic ASCII so it renders correctly in every Windows terminal
-// regardless of font (cmd.exe, PowerShell, Windows Terminal).
-//
-// Height levels (low → high):
-//   _  .  -  ^  |
-//
-// Example:
-//   _._.-^|^-._._.-^||^-._._
+// Rolling window of pps samples rendered as scrolling ASCII waveform.
+// Pure ASCII — works in cmd.exe, PowerShell, Windows Terminal.
+// Height levels (low → high): _  .  -  ^  |
 struct Heartbeat {
     samples:  Vec<f64>,
     capacity: usize,
@@ -95,6 +132,73 @@ impl Heartbeat {
     }
 }
 
+// ── Top talkers table ─────────────────────────────────────────────────────────
+// Only shows processes with activity this window.
+// Sorted: blocked first, then alerted, then packet count.
+fn render_top_talkers(stats: &HashMap<u32, ProcStats>) {
+    // Filter: only show processes with packets OR block/alert events this window
+    let mut top: Vec<_> = stats.iter()
+        .filter(|(_, s)| s.packets > 0 || s.blocked > 0 || s.alerted > 0)
+        .collect();
+
+    if top.is_empty() {
+        return;
+    }
+
+    // Sort: threats first, then by traffic volume
+    top.sort_by(|a, b| {
+        b.1.blocked.cmp(&a.1.blocked)
+            .then(b.1.alerted.cmp(&a.1.alerted))
+            .then(b.1.packets.cmp(&a.1.packets))
+    });
+
+    println!("┌─ TOP PROCESSES (5s window) ──────────────────────────────────┐");
+    println!("│ {:<5} {:<20} {:>7} {:>8} {:>4} {:>4} {:>4} {:>4} │",
+             "PID", "PROCESS", "PKTS", "BYTES", "BLK", "ALT", "DST", "PRO");
+    println!("├──────────────────────────────────────────────────────────────┤");
+
+    for (pid, s) in top.iter().take(8) {
+        let name = if s.name.len() > 20 {
+            format!("{}~", &s.name[..19])
+        } else {
+            s.name.clone()
+        };
+
+        let bytes_str = if s.bytes >= 1_000_000 {
+            format!("{:.1}M", s.bytes as f64 / 1_000_000.0)
+        } else if s.bytes >= 1_000 {
+            format!("{:.1}K", s.bytes as f64 / 1_000.0)
+        } else {
+            format!("{}B", s.bytes)
+        };
+
+        // Prefix ! on blocked/alerted counts so threats are instantly visible
+        let blk_str = if s.blocked > 0 {
+            format!("!{}", s.blocked)
+        } else {
+            "0".to_string()
+        };
+
+        let alrt_str = if s.alerted > 0 {
+            format!("!{}", s.alerted)
+        } else {
+            "0".to_string()
+        };
+
+        println!("│ {:<5} {:<20} {:>7} {:>8} {:>4} {:>4} {:>4} {:>4} │",
+                 pid,
+                 name,
+                 s.packets,
+                 bytes_str,
+                 blk_str,
+                 alrt_str,
+                 s.unique_dsts.len(),
+                 s.protocols.len());
+    }
+
+    println!("└──────────────────────────────────────────────────────────────┘");
+}
+
 // ── Cross-platform shutdown ───────────────────────────────────────────────────
 async fn wait_for_shutdown() {
     #[cfg(unix)]
@@ -123,8 +227,7 @@ async fn wait_for_shutdown() {
 }
 
 // ── Extract malicious IPs from rules.yaml ─────────────────────────────────────
-// Parses only enabled Block rules with explicit IPs (no CIDR ranges).
-// TODO: Replace with policy_engine.get_block_ips() once engine exposes it.
+// Only enabled Block rules with explicit IPs (no CIDR ranges).
 fn extract_malicious_ips_from_rules() -> Vec<String> {
     let rules_path = "configs/rules.yaml";
     let mut ips    = Vec::new();
@@ -132,7 +235,6 @@ fn extract_malicious_ips_from_rules() -> Vec<String> {
     if let Ok(contents) = std::fs::read_to_string(rules_path) {
         if let Ok(rules) = serde_yaml::from_str::<Vec<serde_yaml::Value>>(&contents) {
             for rule in rules {
-                // Skip disabled rules
                 let enabled = rule.get("enabled")
                     .and_then(|e| e.as_bool())
                     .unwrap_or(true);
@@ -147,7 +249,6 @@ fn extract_malicious_ips_from_rules() -> Vec<String> {
                             {
                                 for ip in dst_ips {
                                     if let Some(ip_str) = ip.as_str() {
-                                        // Skip CIDR ranges and placeholder IPs
                                         if !ip_str.contains('/')
                                             && ip_str != "0.0.0.0"
                                             && ip_str != "255.255.255.255"
@@ -218,21 +319,16 @@ pub async fn print_banner(
 
     sleep(Duration::from_millis(300)).await;
 
-    // ── System config ─────────────────────────────────────────────────────────
     println!("┌─ SYSTEM CONFIG ──────────────────────────────────────────────┐");
-
     sleep(Duration::from_millis(120)).await;
     println!("│ Mode           : {:<43} │", config.mode);
-
     sleep(Duration::from_millis(120)).await;
     println!("│ Interface      : {:<43} │", interface_label);
-
     sleep(Duration::from_millis(120)).await;
     println!(
         "│ Promiscuous    : {:<43} │",
         if config.promiscuous { "ENABLED" } else { "DISABLED" }
     );
-
     sleep(Duration::from_millis(120)).await;
     let filter_display = if bpf_filter.len() > 43 {
         format!("{}...", &bpf_filter[..40])
@@ -240,86 +336,70 @@ pub async fn print_banner(
         bpf_filter.to_string()
     };
     println!("│ BPF Filter     : {:<43} │", filter_display);
-
     sleep(Duration::from_millis(120)).await;
     println!(
         "│ Buffer Size    : {:<43} │",
         format!("{} MB", config.buffer_size_mb)
     );
-
     sleep(Duration::from_millis(120)).await;
     println!("│ Platform       : {:<43} │", OS_NAME.to_uppercase());
-
-    // Show control server address
     sleep(Duration::from_millis(120)).await;
     #[cfg(unix)]
     println!("│ Control Socket : {:<43} │", "/var/run/rubix.sock");
     #[cfg(windows)]
     println!("│ Control Socket : {:<43} │", "127.0.0.1:9876");
-
     println!("└──────────────────────────────────────────────────────────────┘");
     println!();
 
     sleep(Duration::from_millis(250)).await;
 
-    // ── Security status ───────────────────────────────────────────────────────
     println!("┌─ SECURITY STATUS ────────────────────────────────────────────┐");
-
     sleep(Duration::from_millis(120)).await;
     println!("│ Policy Rules    : {:<41} │", rules_count);
-
     sleep(Duration::from_millis(120)).await;
     println!("│ Kernel Rules    : {:<41} │", kernel_rules);
-
     sleep(Duration::from_millis(120)).await;
     println!(
         "│ Default Action  : {:<41} │",
         config.blocking.default_action.to_uppercase()
     );
-
     sleep(Duration::from_millis(120)).await;
     println!(
         "│ Auto Cleanup    : {:<41} │",
         if config.blocking.auto_cleanup { "ENABLED" } else { "DISABLED" }
     );
-
     sleep(Duration::from_millis(120)).await;
     println!(
         "│ Block Timeout   : {:<41} │",
         format!("{} sec", config.blocking.block_timeout_seconds)
     );
-
     println!("└──────────────────────────────────────────────────────────────┘");
     println!();
 
     sleep(Duration::from_millis(250)).await;
 
-    // ── Active threats ────────────────────────────────────────────────────────
     if !malicious_ips.is_empty() {
         println!("┌─ ACTIVE THREATS ─────────────────────────────────────────────┐");
-
         sleep(Duration::from_millis(150)).await;
-        println!("│ [!] {} IPs pre-blocked at kernel level{:>23} │", malicious_ips.len(), "");
-
+        println!(
+            "│ [!] {} IPs pre-blocked at kernel level{:>23} │",
+            malicious_ips.len(), ""
+        );
         for ip in malicious_ips.iter().take(5) {
             sleep(Duration::from_millis(80)).await;
             println!("│   + {:<57} │", ip);
         }
-
         if malicious_ips.len() > 5 {
             sleep(Duration::from_millis(80)).await;
             println!("│   ... and {} more{:>39} │", malicious_ips.len() - 5, "");
         }
-
         println!("└──────────────────────────────────────────────────────────────┘");
         println!();
     }
 
     sleep(Duration::from_millis(250)).await;
 
-    // ── Network interfaces ────────────────────────────────────────────────────
     println!("┌─ NETWORK INTERFACES ─────────────────────────────────────────┐");
-
     match CaptureFactory::list_interfaces() {
         Ok(interfaces) => {
             for iface in interfaces.iter().take(10) {
@@ -331,7 +411,6 @@ pub async fn print_banner(
                 } else {
                     display_name.to_string()
                 };
-
                 sleep(Duration::from_millis(80)).await;
                 println!(
                     "│ {:<10} {:<28} {:<20} │",
@@ -345,12 +424,10 @@ pub async fn print_banner(
             println!("│ [!] {:<56} │", format!("Interface error: {}", e));
         }
     }
-
     println!("└──────────────────────────────────────────────────────────────┘");
     println!();
 
     sleep(Duration::from_millis(200)).await;
-
     println!(
         "[*] RUBIX ACTIVE -- Monitoring on {} (Ctrl+C to stop)",
         interface_label
@@ -365,19 +442,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // immediately and silently discards all buffered log lines.
     let _logger = logger::Logger::init_dual()?;
 
-    // Record start time early — used by control server for uptime reporting
+    // Start 30-day log cleanup background task.
+    // MUST be called after tokio runtime has started (inside #[tokio::main]).
+    _logger.start_cleanup_task();
+
     let start_time = std::time::Instant::now();
 
-    // ── Config ───────────────────────────────────────────────────────────────
+    // ── Config ────────────────────────────────────────────────────────────────
     let config_dir    = std::path::Path::new("configs");
     let config_loader = ConfigLoader::load(config_dir, OS_NAME)?;
     let config        = config_loader.get();
 
-    // ── Policy engine ────────────────────────────────────────────────────────
+    // ── Policy engine ─────────────────────────────────────────────────────────
     let policy_engine = Arc::new(PolicyEngine::new());
-
-    // Arc-wrap the reloader so it can be shared with the control server
-    // for hot-reload support via `rubix reload`
     let reloader = Arc::new(PolicyReloader::new(
         policy_engine.clone(),
         "configs/rules.yaml".to_string(),
@@ -407,6 +484,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             warn!(ip = %ip_str, "Skipping invalid IP in rules.yaml");
         }
     }
+
+    // ── Process resolver ──────────────────────────────────────────────────────
+    // Lock-free hot path (~20ns per lookup).
+    // Background refresh every 1s — never blocks packet processing.
+    let resolver = Arc::new(ProcessResolver::new());
+    info!("Process resolver initialized");
 
     // ── Interface auto-detection ──────────────────────────────────────────────
     let interface_name = if config.capture_interface == "auto" {
@@ -446,7 +529,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bpf_filter         = build_bpf_filter(&config.bpf_filter, &malicious_ips);
     let bpf_filter_display = bpf_filter.as_deref().unwrap_or("none").to_string();
 
-    // ── Banner ───────────────────────────────────────────────────────────────
+    // ── Banner ────────────────────────────────────────────────────────────────
     print_banner(
         &config,
         rules_count,
@@ -457,7 +540,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &malicious_ips,
     ).await;
 
-    // ── Capture ──────────────────────────────────────────────────────────────
+    // ── Capture ───────────────────────────────────────────────────────────────
     let capture_config = CaptureConfig {
         interface:      interface_name.clone(),
         promiscuous:    config.promiscuous,
@@ -471,11 +554,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     capture.start().await?;
 
     // ── Control server ────────────────────────────────────────────────────────
-    // Listens for CLI commands:
-    //   Linux   → Unix socket /var/run/rubix.sock
-    //   Windows → TCP loopback 127.0.0.1:9876
-    //
-    // Enables: rubix status / block / unblock / list / reload / rules / stop
+    // Linux   → Unix socket /var/run/rubix.sock
+    // Windows → TCP loopback 127.0.0.1:9876
+    // Commands: rubix status / block / unblock / list / reload / rules / stop
     let ctrl_handler = Arc::new(CommandHandler::new(
         blocker.clone(),
         policy_engine.clone(),
@@ -495,56 +576,122 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         r.store(false, Ordering::SeqCst);
     });
 
-    // ── Packet loop ──────────────────────────────────────────────────────────
-    let mut packet_count  = 0u64;
-    let mut block_count   = 0u64;
-    let mut alert_count   = 0u64;
+    // ── Packet loop ───────────────────────────────────────────────────────────
+    let mut packet_count      = 0u64;
+    let mut block_count       = 0u64;
+    let mut alert_count       = 0u64;
     let mut last_stats_time   = start_time;
     let mut last_packet_count = 0u64;
+    let mut last_top_render   = start_time;
 
     // 30-sample rolling heartbeat waveform
     let mut heartbeat = Heartbeat::new(30);
 
+    // Per-process stats — pre-sized for typical workload (~50 active processes)
+    let mut proc_stats: HashMap<u32, ProcStats> = HashMap::with_capacity(128);
+
     while running.load(Ordering::SeqCst) {
         match timeout(Duration::from_millis(100), capture.next_packet()).await {
+
+            // ── Packet received ───────────────────────────────────────────────
             Ok(Some(packet)) => {
                 packet_count += 1;
 
+                // ── HOT PATH: Process resolution (~20ns) ──────────────────────
+                // Try src (egress) first, then dst (ingress).
+                let proto = Protocol::from_str(&packet.protocol.to_string());
+
+                let proc_info = resolver.lookup(&FlowKey {
+                    local_ip:   packet.src_ip,
+                    local_port: packet.src_port,
+                    protocol:   proto,
+                }).or_else(|| resolver.lookup(&FlowKey {
+                    local_ip:   packet.dst_ip,
+                    local_port: packet.dst_port,
+                    protocol:   proto,
+                }));
+
+                // ── Update per-process stats ──────────────────────────────────
+                if let Some(ref info) = proc_info {
+                    let entry = proc_stats
+                        .entry(info.pid)
+                        .or_insert_with(|| ProcStats::new(info.name.clone()));
+
+                    // Refresh name if process restarted with same PID
+                    if entry.name.is_empty() {
+                        entry.name.clone_from(&info.name);
+                    }
+
+                    entry.packets += 1;
+                    entry.bytes   += packet.size as u64;
+                    entry.unique_dsts.insert(packet.dst_ip);
+                    entry.unique_srcs.insert(packet.src_ip);
+                    entry.protocols.insert(packet.protocol.to_string());
+                }
+
+                // ── Policy evaluation ──────────────────────────────────────────
                 match policy_engine.evaluate(&packet) {
                     RuleAction::Block => {
                         block_count += 1;
-                        // TODO: push to channel export layer
+
+                        if let Some(ref info) = proc_info {
+                            if let Some(s) = proc_stats.get_mut(&info.pid) {
+                                s.blocked += 1;
+                            }
+                        }
+
+                        let proc_label = proc_info.as_ref()
+                            .map(|p| format!("{}({})", p.name, p.pid))
+                            .unwrap_or_else(|| "unknown".into());
+
                         AlertLogger::log_block(
                             &packet.src_ip.to_string(),
                             &packet.dst_ip.to_string(),
                             packet.src_port,
                             packet.dst_port,
                             &packet.protocol.to_string(),
-                            "policy-block",
+                            &format!("proc={}", proc_label),
                         );
                     }
+
                     RuleAction::Alert => {
                         alert_count += 1;
-                        // TODO: push to channel export layer
+
+                        if let Some(ref info) = proc_info {
+                            if let Some(s) = proc_stats.get_mut(&info.pid) {
+                                s.alerted += 1;
+                            }
+                        }
+
+                        let proc_label = proc_info.as_ref()
+                            .map(|p| format!("{}({})", p.name, p.pid))
+                            .unwrap_or_else(|| "unknown".into());
+
                         AlertLogger::log_alert(
                             &packet.src_ip.to_string(),
                             &packet.dst_ip.to_string(),
                             packet.src_port,
                             packet.dst_port,
                             &packet.protocol.to_string(),
-                            "policy-alert",
+                            &format!("proc={}", proc_label),
                         );
                     }
+
                     RuleAction::Allow => {
-                        // Hot path — no logging
+                        // Hot path — no logging for allowed packets
                     }
                 }
 
                 // ── Stats / heartbeat ─────────────────────────────────────────
-                // Sample every 500 packets, redraw only if 0.5s elapsed.
-                // Avoids calling Instant::now() on every single packet.
-                if packet_count % 500 == 0 {
+                // Adaptive check interval:
+                //   < 1000 packets total → check every 50  (low pps, responsive)
+                //   ≥ 1000 packets total → check every 500 (high pps, efficient)
+                // Secondary gate: only redraw if ≥ 0.5s has elapsed.
+                let check_interval = if packet_count < 1000 { 50 } else { 500 };
+
+                if packet_count % check_interval == 0 {
                     let now = std::time::Instant::now();
+
                     if now.duration_since(last_stats_time).as_secs_f64() >= 0.5 {
                         let elapsed          = now.duration_since(start_time).as_secs_f64();
                         let interval_packets = packet_count - last_packet_count;
@@ -560,8 +707,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         let wave   = heartbeat.render();
                         let status = Heartbeat::status_label(block_count, alert_count);
 
+                        // \r   — move cursor to start of line
+                        // \x1B[2K — erase entire line (prevents bleed from longer prev lines)
                         print!(
-                            "\r{status} |{wave}| {pps:>5.0} pps | pkts:{pkts:>8} blk:{blk:>4} alrt:{alrt:>4} | avg:{avg:>5.0}",
+                            "\r\x1B[2K{status} |{wave}| {pps:>5.0} pps | pkts:{pkts:>8} blk:{blk:>4} alrt:{alrt:>4} | avg:{avg:>5.0}",
                             status = status,
                             wave   = wave,
                             pps    = pps,
@@ -572,15 +721,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         );
                         let _ = std::io::stdout().flush();
 
+                        // ── Top talkers every 5s ──────────────────────────────
+                        // Guard: only render if processes with actual activity exist.
+                        if now.duration_since(last_top_render).as_secs() >= 5
+                            && proc_stats.values().any(|s| s.packets > 0)
+                        {
+                            println!();  // Finish heartbeat line before table
+                            render_top_talkers(&proc_stats);
+                            last_top_render = now;
+
+                            // Reset rolling-window counters, keep names + unique sets
+                            for s in proc_stats.values_mut() {
+                                s.reset_window();
+                            }
+
+                            // Prune stale processes — cap map at 64 entries
+                            // Keep any process that has unique endpoints (was ever active)
+                            if proc_stats.len() > 64 {
+                                proc_stats.retain(|_, s| !s.unique_dsts.is_empty());
+                            }
+                        }
+
                         last_stats_time   = now;
                         last_packet_count = packet_count;
                     }
                 }
             }
 
+            // ── No packet (quiet period) ──────────────────────────────────────
             Ok(None) => {
-                // No packet — drop waveform to baseline during quiet periods
                 let now = std::time::Instant::now();
+
+                // Update heartbeat baseline every 2s during quiet periods
                 if now.duration_since(last_stats_time).as_secs() >= 2 {
                     heartbeat.push(0.0);
 
@@ -593,7 +765,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     };
 
                     print!(
-                        "\r{status} |{wave}|     0 pps | pkts:{pkts:>8} blk:{blk:>4} alrt:{alrt:>4} | avg:{avg:>5.0}",
+                        "\r\x1B[2K{status} |{wave}|     0 pps | pkts:{pkts:>8} blk:{blk:>4} alrt:{alrt:>4} | avg:{avg:>5.0}",
                         status = status,
                         wave   = wave,
                         pkts   = packet_count,
@@ -603,14 +775,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     let _ = std::io::stdout().flush();
 
+                    // Render top talkers during quiet periods if due
+                    if now.duration_since(last_top_render).as_secs() >= 5
+                        && proc_stats.values().any(|s| s.packets > 0)
+                    {
+                        println!();
+                        render_top_talkers(&proc_stats);
+                        last_top_render = now;
+
+                        for s in proc_stats.values_mut() {
+                            s.reset_window();
+                        }
+
+                        if proc_stats.len() > 64 {
+                            proc_stats.retain(|_, s| !s.unique_dsts.is_empty());
+                        }
+                    }
+
                     last_stats_time = now;
                 }
 
                 sleep(Duration::from_micros(100)).await;
             }
 
+            // ── 100ms timeout — loop back and check running flag ──────────────
             Err(_) => {
-                // 100ms timeout — loop back to check running flag
                 continue;
             }
         }
@@ -630,14 +819,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         );
     }
 
-    // Reduced from 5s to 2s for faster graceful shutdown
+    // Give capture 2 seconds to drain cleanly
     if timeout(Duration::from_secs(2), capture.stop()).await.is_err() {
         warn!("Capture did not stop cleanly within 2 seconds");
+    }
+
+    // Final process snapshot before exit
+    if proc_stats.values().any(|s| !s.unique_dsts.is_empty()) {
+        render_top_talkers(&proc_stats);
     }
 
     let elapsed = start_time.elapsed().as_secs_f64();
     let avg_pps = if elapsed > 0.0 { packet_count as f64 / elapsed } else { 0.0 };
 
+    println!();
     println!("┌─ FINAL STATISTICS ──────────────────────────────────────────────┐");
     println!("│ Total Packets:  {:<48} │", packet_count);
     println!("│ Total Blocked:  {:<48} │", block_count);

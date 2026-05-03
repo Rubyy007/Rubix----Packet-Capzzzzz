@@ -1,73 +1,97 @@
-//! DNS resolution cache
+//! Lock-free read path with atomic refresh coordination.
 
+use super::{FlowKey, ProcessInfo, snapshot};
 use std::collections::HashMap;
-use std::net::IpAddr;
-use std::sync::RwLock;
-use std::time::{SystemTime, Duration, UNIX_EPOCH};
+use std::sync::Arc;
+use parking_lot::RwLock;
+use std::sync::atomic::{AtomicU64, AtomicBool, Ordering};
+use std::time::Duration;
 
-pub struct DnsCache {
-    cache: RwLock<HashMap<String, CachedEntry>>,
-    ttl_secs: u64,
-    max_size: usize,
+pub struct ProcessResolver {
+    table:           Arc<RwLock<HashMap<FlowKey, ProcessInfo>>>,
+    last_refresh_ns: Arc<AtomicU64>,
+    refreshing:      Arc<AtomicBool>,
+    ttl_ns:          u64,
 }
 
-struct CachedEntry {
-    ips: Vec<IpAddr>,
-    expires_at: u64,
-}
+impl ProcessResolver {
+    pub fn new() -> Self {
+        Self::with_ttl(Duration::from_millis(1000))
+    }
 
-impl DnsCache {
-    pub fn new(ttl_secs: u64, max_size: usize) -> Self {
+    pub fn with_ttl(ttl: Duration) -> Self {
+        let initial = HashMap::with_capacity(512);
+        
         Self {
-            cache: RwLock::new(HashMap::with_capacity(max_size)),
-            ttl_secs,
-            max_size,
+            table:           Arc::new(RwLock::new(initial)),
+            last_refresh_ns: Arc::new(AtomicU64::new(0)),
+            refreshing:      Arc::new(AtomicBool::new(false)),
+            ttl_ns:          ttl.as_nanos() as u64,
         }
     }
-    
-    pub fn get(&self, domain: &str) -> Option<Vec<IpAddr>> {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+
+    #[inline(always)]
+    pub fn lookup(&self, key: &FlowKey) -> Option<ProcessInfo> {
+        self.maybe_refresh_async();
+        self.table.read().get(key).cloned()
+    }
+
+    pub fn all_processes(&self) -> Vec<ProcessInfo> {
+        self.maybe_refresh_async();
         
-        let cache = self.cache.read().unwrap();
+        let guard = self.table.read();
+        let mut seen = std::collections::HashSet::with_capacity(64);
         
-        if let Some(entry) = cache.get(domain) {
-            if entry.expires_at > now {
-                return Some(entry.ips.clone());
-            }
+        guard.values()
+            .filter(|p| seen.insert(p.pid))
+            .cloned()
+            .collect()
+    }
+
+    #[inline]
+    pub fn flow_count(&self) -> usize {
+        self.table.read().len()
+    }
+
+    #[inline(always)]
+    fn maybe_refresh_async(&self) {
+        let now_ns = Self::now_nanos();
+        let last   = self.last_refresh_ns.load(Ordering::Relaxed);
+        
+        if now_ns.saturating_sub(last) < self.ttl_ns {
+            return;
         }
-        
-        None
-    }
-    
-    pub fn set(&self, domain: &str, ips: Vec<IpAddr>) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        
-        let mut cache = self.cache.write().unwrap();
-        
-        // Evict oldest if at capacity
-        if cache.len() >= self.max_size {
-            if let Some(oldest) = cache.keys().next().cloned() {
-                cache.remove(&oldest);
-            }
+
+        if self.refreshing.compare_exchange(
+            false, true,
+            Ordering::Acquire,
+            Ordering::Relaxed
+        ).is_ok() {
+            let table     = self.table.clone();
+            let timestamp = self.last_refresh_ns.clone();
+            let flag      = self.refreshing.clone();
+            
+            tokio::spawn(async move {
+                if let Ok(snap) = snapshot() {
+                    *table.write() = snap;
+                    timestamp.store(Self::now_nanos(), Ordering::Release);
+                }
+                flag.store(false, Ordering::Release);
+            });
         }
-        
-        cache.insert(domain.to_string(), CachedEntry {
-            ips,
-            expires_at: now + self.ttl_secs,
-        });
     }
-    
-    pub fn clear(&self) {
-        self.cache.write().unwrap().clear();
+
+    #[inline(always)]
+    fn now_nanos() -> u64 {
+        use std::time::SystemTime;
+        SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap_or(Duration::ZERO)
+            .as_nanos() as u64
     }
-    
-    pub fn len(&self) -> usize {
-        self.cache.read().unwrap().len()
-    }
+}
+
+impl Default for ProcessResolver {
+    #[inline]
+    fn default() -> Self { Self::new() }
 }
