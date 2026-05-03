@@ -9,7 +9,9 @@ mod blocker;
 mod logger;
 mod control;
 mod resolver;
+mod detector;
 
+use detector::{ScanDetector, PingDetector, ThreatTracker, ThreatEvent, Severity};
 use policy::{PolicyEngine, PolicyReloader, RuleAction};
 use config::loader::ConfigLoader;
 use blocker::{PlatformBlocker, Blocker};
@@ -590,6 +592,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Per-process stats — pre-sized for typical workload (~50 active processes)
     let mut proc_stats: HashMap<u32, ProcStats> = HashMap::with_capacity(128);
 
+    // Threat detection
+    let mut threat_tracker = ThreatTracker::new();
+    let mut recent_threats: std::collections::VecDeque<ThreatEvent> =
+        std::collections::VecDeque::with_capacity(50);
+
     while running.load(Ordering::SeqCst) {
         match timeout(Duration::from_millis(100), capture.next_packet()).await {
 
@@ -627,6 +634,72 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     entry.unique_dsts.insert(packet.dst_ip);
                     entry.unique_srcs.insert(packet.src_ip);
                     entry.protocols.insert(packet.protocol.to_string());
+                }
+
+                // ── Threat detection ───────────────────────────────────────────────
+                let threats: Vec<ThreatEvent> = match packet.protocol {
+                    crate::types::Protocol::Tcp => {
+                        ScanDetector::analyze_tcp(
+                            &mut threat_tracker,
+                            packet.src_ip,
+                            packet.dst_port,
+                            &packet.flags,
+                        )
+                    }
+                    crate::types::Protocol::Udp => {
+                        ScanDetector::analyze_udp(
+                            &mut threat_tracker,
+                            packet.src_ip,
+                            packet.dst_port,
+                        )
+                    }
+                    crate::types::Protocol::Icmp | crate::types::Protocol::Icmpv6 => {
+                        // Echo request = type 8 for ICMPv4, type 128 for ICMPv6
+                        // We treat all ICMP from external IPs as potential sweep
+                        PingDetector::analyze(
+                            &mut threat_tracker,
+                            packet.src_ip,
+                            true, // treat all ICMP as echo request for simplicity
+                        )
+                    }
+                    _ => vec![],
+                };
+
+                // ── Handle detected threats ────────────────────────────────────────
+                for threat in threats {
+                    // Print alert immediately — on new line so it doesn't corrupt heartbeat
+                    println!(
+                        "\n{} {} DETECTED: {} | src={} | {}",
+                        threat.severity.icon(),
+                        threat.severity.as_str(),
+                        threat.kind.as_str(),
+                        threat.src_ip,
+                        threat.detail,
+                    );
+
+                    // Log to alert file
+                    AlertLogger::log_block(
+                        &threat.src_ip.to_string(),
+                        "local",
+                        0,
+                        0,
+                        "DETECT",
+                        &format!("{}:{}", threat.kind.as_str(), threat.detail),
+                    );
+
+                    // Store for dashboard
+                    recent_threats.push_back(threat.clone());
+                    if recent_threats.len() > 50 {
+                        recent_threats.pop_front();
+                    }
+
+                    // Increment alert counter so heartbeat shows [ALERTING]
+                    alert_count += 1;
+                }
+
+                // Periodic eviction of stale tracker state
+                if packet_count % 1000 == 0 {
+                    threat_tracker.maybe_evict();
                 }
 
                 // ── Policy evaluation ──────────────────────────────────────────
