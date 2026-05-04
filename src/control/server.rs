@@ -8,7 +8,7 @@ use super::commands::{Command, CommandResponse};
 use super::handler::CommandHandler;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tracing::{error, info, warn};
+use tracing::{error, info, trace, warn};
 
 pub struct ControlServer {
     handler: Arc<CommandHandler>,
@@ -136,7 +136,7 @@ async fn run_tcp_server(handler: Arc<CommandHandler>) {
     loop {
         match listener.accept().await {
             Ok((stream, peer)) => {
-                info!(peer = %peer, "Control connection accepted");
+                trace!(peer = %peer, "Control connection accepted");
                 let handler = handler.clone();
                 tokio::spawn(async move {
                     let (reader, writer) = stream.into_split();

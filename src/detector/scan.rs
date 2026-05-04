@@ -1,41 +1,61 @@
-//! TCP/UDP port scan and nmap detection — production hot path
+// src/detector/scan.rs
+//! TCP/UDP port scan and nmap detection — production hot path.
+//!
+//! All detect paths return Option<ThreatEvent> where ThreatEvent::detail
+//! is always a &'static str — zero allocation on the hot path.
+//!
+//! Detection order (highest severity first):
+//!   1. SYN flood     — always checked regardless of trust
+//!   2. NULL scan     — no TCP flags
+//!   3. FIN scan      — FIN only
+//!   4. XMAS scan     — FIN+PSH+URG
+//!   5. ACK scan      — ACK only, no SYN history, 8+ distinct ports
+//!   6. SYN scan      — 15+ ports, 20+ SYNs
+//!   7. Sequential    — 12+ consecutive port numbers
+//!   8. OS fingerprint— 2+ weird flag patterns
+//!   9. General scan  — 20+ distinct ports catch-all
+//!
+//! Trust levels adjust thresholds but never skip SYN flood detection.
+//! High-trust egress skips scan detection (not flood detection).
 
 use std::net::IpAddr;
 use std::time::Instant;
 
 use crate::types::PacketFlags;
-use super::{ThreatEvent, ThreatKind};
-use super::tracker::ThreatTracker;
+use super::{AlertKey, ThreatEvent, ThreatKind};
+use super::tracker::{
+    ThreatTracker, is_whitelisted, is_highly_trusted_process, is_medium_trust_process,
+    ACK_SCAN_PORT_THRESHOLD, SCAN_PORT_THRESHOLD, SYN_FLOOD_THRESHOLD,
+};
 
-// ── Static detail strings ───────────────────────────────────────────────────
+// ── Static detail strings — no heap allocation ever ───────────────────────────
 
-static DETAIL_NULL:     &str = "NULL scan detected (no TCP flags)";
-static DETAIL_FIN:      &str = "FIN scan detected (nmap -sF)";
-static DETAIL_XMAS:     &str = "XMAS scan detected (nmap -sX, FIN+PSH+URG)";
-static DETAIL_ACK:      &str = "ACK scan detected (nmap -sA, firewall mapping)";
-static DETAIL_SYN:      &str = "SYN scan detected (nmap -sS, half-open)";
-static DETAIL_SYNFLOOD: &str = "SYN flood DoS detected";
-static DETAIL_CONNECT:  &str = "Connect scan detected (nmap -sT)";
-static DETAIL_SEQ:      &str = "Sequential port scan detected";
-static DETAIL_OS:       &str = "OS fingerprinting detected (nmap -O)";
-static DETAIL_UDP:      &str = "UDP scan detected (nmap -sU)";
+static DETAIL_NULL:     &str = "NULL scan (no TCP flags) — nmap -sN";
+static DETAIL_FIN:      &str = "FIN scan (FIN only) — nmap -sF";
+static DETAIL_XMAS:     &str = "XMAS scan (FIN+PSH+URG) — nmap -sX";
+static DETAIL_ACK:      &str = "ACK scan (firewall mapping) — nmap -sA";
+static DETAIL_SYN:      &str = "SYN scan (half-open) — nmap -sS";
+static DETAIL_SYNFLOOD: &str = "SYN flood DoS — high-rate SYNs with no ACK";
+static DETAIL_CONNECT:  &str = "Connect scan (full TCP) — nmap -sT";
+static DETAIL_SEQ:      &str = "Sequential port scan — automated tool";
+static DETAIL_OS:       &str = "OS fingerprinting — nmap -O / weird TCP flags";
+static DETAIL_UDP:      &str = "UDP scan — nmap -sU";
 
-// ── Thresholds for specific scans ────────────────────────────────────────────
+// ── Thresholds ────────────────────────────────────────────────────────────────
 
-const NULL_MIN_PORTS: u32     = 2;
-const FIN_MIN_PORTS: u32      = 2;
-const XMAS_MIN_PORTS: u32     = 2;
-const ACK_MIN_PORTS: u32      = 5;
 const SYN_SCAN_MIN_PORTS: u32 = 15;
-const SYN_SCAN_MIN_SYNS: u32  = 20;
-const OS_WEIRD_FLAGS_MIN: u32 = 2;
+const SYN_SCAN_MIN_SYNS:  u32 = 20;
+const OS_WEIRD_FLAGS_MIN:  u32 = 2;
 
 // ── ScanDetector ─────────────────────────────────────────────────────────────
 
 pub struct ScanDetector;
 
 impl ScanDetector {
-    /// TCP analysis — hot path, ~20ns typical
+    /// TCP analysis — hot path.
+    ///
+    /// Typical cost: ~20 ns (whitelist hit), ~60 ns (full path, no alert).
+    /// Alert path: ~80 ns (static string, no format!).
     #[inline(always)]
     pub fn analyze_tcp(
         tracker:    &mut ThreatTracker,
@@ -45,143 +65,170 @@ impl ScanDetector {
         proc_name:  Option<&str>,
         is_ingress: bool,
     ) -> Option<ThreatEvent> {
-        // Fast reject: whitelisted
-        if super::tracker::is_whitelisted(src_ip) {
+        // ── Fast reject: whitelisted infrastructure ───────────────────────────
+        if is_whitelisted(src_ip) {
             return None;
         }
 
-        // Determine trust level
-        let trust = match proc_name {
-            Some(name) if super::tracker::is_highly_trusted_process(name) => TrustLevel::High,
-            Some(name) if super::tracker::is_medium_trust_process(name) => TrustLevel::Medium,
-            _ => TrustLevel::Unknown,
-        };
+        // ── Trust classification ──────────────────────────────────────────────
+        // Security note: trust reduces thresholds but never eliminates flood
+        // detection. A compromised trusted process (browser, Teams) can still
+        // trigger a SYN flood alert.
+        let trust = proc_name.map_or(Trust::Unknown, |n| {
+            if is_highly_trusted_process(n) { Trust::High }
+            else if is_medium_trust_process(n) { Trust::Medium }
+            else { Trust::Unknown }
+        });
 
-        // High trust + egress — skip deep inspection
-        let skip_deep = matches!(trust, TrustLevel::High) && !is_ingress;
+        // High-trust outbound traffic skips scan detection but NOT flood.
+        // Rationale: browsers make many TCP connections legitimately; they
+        // do not send NULL/FIN/XMAS scans or ACK sweeps.
+        let skip_scan = matches!(trust, Trust::High) && !is_ingress;
 
-        // ── Update state ──────────────────────────────────────────────────────
-        
+        // ── Update per-IP state ───────────────────────────────────────────────
         let state = tracker.get_or_create(src_ip);
         state.touch();
         state.ports_hit.insert(dst_port);
         state.port_history.push(dst_port);
-        
-        if state.port_history.len() > 64 {
-            state.port_history.remove(0);
-        }
 
         let flag_byte = flags_to_byte(flags);
-        state.tcp_flags_seen.insert(flag_byte);
+        state.record_flags(flag_byte);
 
         let is_syn = flags.syn && !flags.ack;
+
         if is_syn {
             state.syn_times.push(Instant::now());
         }
 
-        // Amortized maintenance
+        // Amortized growth cap — every 16 packets
         if state.total_packets & 0x0F == 0 {
             state.cap_growth();
         }
 
-        // ── Detection heuristics (ordered by severity) ────────────────────────
-        
-        // 1. SYN flood — always check, most severe
+        // ── 1. SYN flood — highest priority, always checked ───────────────────
         if is_syn {
-            let syn_count = state.syn_times.len() as u32;
             let threshold = match trust {
-                TrustLevel::High => super::tracker::SYN_FLOOD_THRESHOLD * 5,
-                TrustLevel::Medium => super::tracker::SYN_FLOOD_THRESHOLD * 2,
-                TrustLevel::Unknown => super::tracker::SYN_FLOOD_THRESHOLD,
+                Trust::High    => SYN_FLOOD_THRESHOLD * 5,
+                Trust::Medium  => SYN_FLOOD_THRESHOLD * 2,
+                Trust::Unknown => SYN_FLOOD_THRESHOLD,
             };
-            if syn_count >= threshold && !state.already_alerted("syn_flood") {
-                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::SynFlood, DETAIL_SYNFLOOD));
+            if state.syn_times.len() as u32 >= threshold {
+                let kind = ThreatKind::SynFlood;
+                if !state.is_suppressed(AlertKey::SynFlood, kind.cooldown_secs()) {
+                    return Some(ThreatEvent::new(src_ip, kind, DETAIL_SYNFLOOD));
+                }
             }
         }
 
-        // Skip deep inspection for trusted egress
-        if skip_deep {
+        // ── Skip scan detection for trusted outbound traffic ──────────────────
+        if skip_scan {
             return None;
         }
 
-        // 2. NULL scan
-        if flag_byte == 0x00 {
-            let port_count = state.ports_hit.len() as u32;
-            if port_count >= NULL_MIN_PORTS && !state.already_alerted("null_scan") {
-                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::NullScan, DETAIL_NULL));
-            }
-        }
-
-        // 3. FIN scan
-        if flags.fin && !flags.syn && !flags.ack && !flags.rst && !flags.psh && !flags.urg {
-            let port_count = state.ports_hit.len() as u32;
-            if port_count >= FIN_MIN_PORTS && !state.already_alerted("fin_scan") {
-                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::FinScan, DETAIL_FIN));
-            }
-        }
-
-        // 4. XMAS scan
-        if flags.fin && flags.psh && flags.urg && !flags.syn && !flags.ack {
-            let port_count = state.ports_hit.len() as u32;
-            if port_count >= XMAS_MIN_PORTS && !state.already_alerted("xmas_scan") {
-                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::XmasScan, DETAIL_XMAS));
-            }
-        }
-
-        // 5. ACK scan — ONLY ACK, no SYN ever seen, 5+ ports
-        if flags.ack && !flags.syn && !flags.fin && !flags.rst && !flags.psh {
-            let no_syn_history = state.syn_times.is_empty();
-            let port_count = state.ports_hit.len() as u32;
-            if no_syn_history && port_count >= ACK_MIN_PORTS && !state.already_alerted("ack_scan") {
-                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::AckScan, DETAIL_ACK));
-            }
-        }
-
-        // 6. SYN scan
-        if is_syn {
-            let port_count = state.ports_hit.len() as u32;
-            let syn_count = state.syn_times.len() as u32;
-            let threshold_ports = match trust {
-                TrustLevel::Medium => SYN_SCAN_MIN_PORTS * 2,
-                _ => SYN_SCAN_MIN_PORTS,
-            };
-            let threshold_syns = match trust {
-                TrustLevel::Medium => SYN_SCAN_MIN_SYNS * 2,
-                _ => SYN_SCAN_MIN_SYNS,
-            };
-            if port_count >= threshold_ports 
-                && syn_count >= threshold_syns 
-                && !state.already_alerted("syn_scan") 
-            {
-                return Some(ThreatEvent::new_fast(src_ip, ThreatKind::SynScan, DETAIL_SYN));
-            }
-        }
-
-        // 7. Sequential scan
-        if state.has_sequential_ports() && !state.already_alerted("sequential_scan") {
-            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::ConnectScan, DETAIL_SEQ));
-        }
-
-        // 8. OS fingerprinting — weird flag patterns
-        let weird = state.weird_flag_count();
-        if weird >= OS_WEIRD_FLAGS_MIN && !state.already_alerted("os_scan") {
-            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::OsScan, DETAIL_OS));
-        }
-
-        // 9. General port scan catch-all
         let port_count = state.ports_hit.len() as u32;
+
+        // ── 2. NULL scan — zero TCP flags ─────────────────────────────────────
+        if flag_byte == 0x00 && port_count >= 2 {
+            let kind = ThreatKind::NullScan;
+            if !state.is_suppressed(AlertKey::NullScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_NULL));
+            }
+        }
+
+        // ── 3. FIN scan — FIN only (no SYN, no ACK, no RST, no PSH) ─────────
+        if flags.fin && !flags.syn && !flags.ack && !flags.rst && !flags.psh && !flags.urg
+            && port_count >= 2
+        {
+            let kind = ThreatKind::FinScan;
+            if !state.is_suppressed(AlertKey::FinScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_FIN));
+            }
+        }
+
+        // ── 4. XMAS scan — FIN + PSH + URG ───────────────────────────────────
+        if flags.fin && flags.psh && flags.urg && !flags.syn && !flags.ack
+            && port_count >= 2
+        {
+            let kind = ThreatKind::XmasScan;
+            if !state.is_suppressed(AlertKey::XmasScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_XMAS));
+            }
+        }
+
+        // ── 5. ACK scan ───────────────────────────────────────────────────────
+        //
+        // Detection criteria (all must hold):
+        //   a) Pure ACK: ACK set, SYN/FIN/RST/PSH all clear
+        //   b) No SYN ever seen from this IP (rules out normal TCP handshakes)
+        //   c) At least ACK_SCAN_PORT_THRESHOLD distinct destination ports
+        //
+        // The no-SYN guard is the key false-positive reducer: legitimate TCP
+        // connections always start with SYN, so an IP we've seen do a normal
+        // handshake is not doing an ACK scan. CDN keepalives are whitelisted
+        // by IP so they never reach this point.
+        if flags.ack
+            && !flags.syn && !flags.fin && !flags.rst && !flags.psh && !flags.urg
+            && state.syn_times.is_empty()
+            && port_count >= ACK_SCAN_PORT_THRESHOLD
+        {
+            let kind = ThreatKind::AckScan;
+            if !state.is_suppressed(AlertKey::AckScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_ACK));
+            }
+        }
+
+        // ── 6. SYN scan ───────────────────────────────────────────────────────
+        if is_syn {
+            let min_ports = match trust {
+                Trust::Medium  => SYN_SCAN_MIN_PORTS * 2,
+                _              => SYN_SCAN_MIN_PORTS,
+            };
+            let min_syns = match trust {
+                Trust::Medium  => SYN_SCAN_MIN_SYNS * 2,
+                _              => SYN_SCAN_MIN_SYNS,
+            };
+            if port_count >= min_ports && state.syn_times.len() as u32 >= min_syns {
+                let kind = ThreatKind::SynScan;
+                if !state.is_suppressed(AlertKey::SynScan, kind.cooldown_secs()) {
+                    return Some(ThreatEvent::new(src_ip, kind, DETAIL_SYN));
+                }
+            }
+        }
+
+        // ── 7. Sequential port scan ───────────────────────────────────────────
+        if state.has_sequential_ports() {
+            let kind = ThreatKind::ConnectScan;
+            if !state.is_suppressed(AlertKey::ConnectScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_SEQ));
+            }
+        }
+
+        // ── 8. OS fingerprinting — weird flag combinations ────────────────────
+        if state.weird_flag_count() >= OS_WEIRD_FLAGS_MIN {
+            let kind = ThreatKind::OsScan;
+            if !state.is_suppressed(AlertKey::OsScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_OS));
+            }
+        }
+
+        // ── 9. General port scan catch-all ────────────────────────────────────
         let threshold = match trust {
-            TrustLevel::Medium => super::tracker::SCAN_PORT_THRESHOLD * 2,
-            _ => super::tracker::SCAN_PORT_THRESHOLD,
+            Trust::Medium  => SCAN_PORT_THRESHOLD * 2,
+            _              => SCAN_PORT_THRESHOLD,
         };
-        if port_count >= threshold && !state.already_alerted("port_scan") {
-            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::ConnectScan, DETAIL_CONNECT));
+        if port_count >= threshold {
+            let kind = ThreatKind::ConnectScan;
+            if !state.is_suppressed(AlertKey::ConnectScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_CONNECT));
+            }
         }
 
         None
     }
 
-    /// UDP scan detection — minimal
+    /// UDP scan detection.
+    ///
+    /// Simpler than TCP: no flag analysis, just port count threshold.
     #[inline(always)]
     pub fn analyze_udp(
         tracker:    &mut ThreatTracker,
@@ -190,13 +237,14 @@ impl ScanDetector {
         proc_name:  Option<&str>,
         is_ingress: bool,
     ) -> Option<ThreatEvent> {
-        if super::tracker::is_whitelisted(src_ip) {
+        if is_whitelisted(src_ip) {
             return None;
         }
 
-        // High trust outbound UDP — DNS, QUIC, etc.
+        // High-trust outbound UDP: DNS (53), QUIC (443/80), NTP (123) —
+        // these are legitimate high-volume UDP flows.
         if let Some(name) = proc_name {
-            if super::tracker::is_highly_trusted_process(name) && !is_ingress {
+            if is_highly_trusted_process(name) && !is_ingress {
                 return None;
             }
         }
@@ -205,37 +253,49 @@ impl ScanDetector {
         state.touch();
         state.ports_hit.insert(dst_port);
 
-        let port_count = state.ports_hit.len() as u32;
+        if state.total_packets & 0x0F == 0 {
+            state.cap_growth();
+        }
+
         let threshold = match proc_name {
-            Some(name) if super::tracker::is_medium_trust_process(name) => super::tracker::SCAN_PORT_THRESHOLD * 2,
-            _ => super::tracker::SCAN_PORT_THRESHOLD,
+            Some(n) if is_medium_trust_process(n) => SCAN_PORT_THRESHOLD * 2,
+            _                                      => SCAN_PORT_THRESHOLD,
         };
 
-        if port_count >= threshold && !state.already_alerted("udp_scan") {
-            return Some(ThreatEvent::new_fast(src_ip, ThreatKind::UdpScan, DETAIL_UDP));
+        if state.ports_hit.len() as u32 >= threshold {
+            let kind = ThreatKind::UdpScan;
+            if !state.is_suppressed(AlertKey::UdpScan, kind.cooldown_secs()) {
+                return Some(ThreatEvent::new(src_ip, kind, DETAIL_UDP));
+            }
         }
 
         None
     }
 }
 
-// ── Internal ─────────────────────────────────────────────────────────────────
+// ── Internal helpers ──────────────────────────────────────────────────────────
+
+/// Pack a PacketFlags struct into a single byte using the standard TCP bit layout:
+///   bit 0 = FIN, bit 1 = SYN, bit 2 = RST, bit 3 = PSH,
+///   bit 4 = ACK, bit 5 = URG
+///
+/// This matches the wire format so the byte values are portable and match
+/// what tcpdump/wireshark would show.
+#[inline(always)]
+fn flags_to_byte(flags: &PacketFlags) -> u8 {
+    (flags.fin as u8)       // bit 0
+    | ((flags.syn as u8) << 1)  // bit 1
+    | ((flags.rst as u8) << 2)  // bit 2
+    | ((flags.psh as u8) << 3)  // bit 3
+    | ((flags.ack as u8) << 4)  // bit 4
+    | ((flags.urg as u8) << 5)  // bit 5
+}
+
+// ── Trust level (packet-loop-local enum) ─────────────────────────────────────
 
 #[derive(Clone, Copy)]
-enum TrustLevel {
+enum Trust {
     Unknown,
     Medium,
     High,
-}
-
-#[inline(always)]
-fn flags_to_byte(flags: &PacketFlags) -> u8 {
-    let mut b = 0u8;
-    b |= (flags.fin as u8) << 0;
-    b |= (flags.syn as u8) << 1;
-    b |= (flags.rst as u8) << 2;
-    b |= (flags.psh as u8) << 3;
-    b |= (flags.ack as u8) << 4;
-    b |= (flags.urg as u8) << 5;
-    b
 }
