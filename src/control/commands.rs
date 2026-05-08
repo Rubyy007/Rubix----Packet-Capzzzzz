@@ -45,6 +45,16 @@ pub enum Command {
 
     /// List all loaded policy rules.
     GetRules,
+
+    /// Return the structured live log ring buffer from `LiveStats`.
+    ///
+    /// The daemon responds with a `CommandResponse` whose `live_stats`
+    /// field contains the full snapshot — the CLI extracts `recent_logs`
+    /// and applies its own client-side filter.
+    ///
+    /// Re-uses the existing `stats` snapshot path so no new IPC or locking
+    /// primitives are needed.
+    Logs,
 }
 
 // ── Responses (daemon → CLI) ──────────────────────────────────────────────────
@@ -58,7 +68,7 @@ pub struct CommandResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data:      Option<serde_json::Value>,
 
-    /// Full live-stats snapshot — only set for the `Stats` command.
+    /// Full live-stats snapshot — set for both `Stats` and `Logs` commands.
     /// Kept as a dedicated field (not folded into `data`) so the CLI can
     /// deserialise it without extra JSON pointer lookups.
     #[serde(skip_serializing_if = "Option::is_none")]

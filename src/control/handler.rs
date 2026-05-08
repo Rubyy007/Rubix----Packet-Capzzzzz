@@ -30,7 +30,7 @@ pub struct CommandHandler {
     reloader:      Arc<PolicyReloader>,
     start_time:    Instant,
     /// Live stats written by the packet loop every ~500 ms.
-    /// The CLI `monitor` command reads this once per second.
+    /// The CLI `monitor` and `logs` commands read this once per second.
     shared_stats:  Arc<RwLock<LiveStats>>,
 }
 
@@ -47,15 +47,16 @@ impl CommandHandler {
 
     pub async fn handle(&self, command: Command) -> CommandResponse {
         match command {
-            Command::Status                               => self.status().await,
-            Command::Stats                               => self.stats(),
-            Command::BlockIp { ip, duration_secs, reason } =>
+            Command::Status                                  => self.status().await,
+            Command::Stats                                   => self.stats(),
+            Command::Logs                                    => self.logs(),
+            Command::BlockIp { ip, duration_secs, reason }  =>
                 self.block_ip(ip, duration_secs, reason).await,
-            Command::UnblockIp { ip }                    => self.unblock_ip(ip).await,
-            Command::ListBlocked                         => self.list_blocked().await,
-            Command::ReloadConfig                        => self.reload_config().await,
-            Command::Shutdown                            => self.shutdown().await,
-            Command::GetRules                            => self.get_rules().await,
+            Command::UnblockIp { ip }                        => self.unblock_ip(ip).await,
+            Command::ListBlocked                             => self.list_blocked().await,
+            Command::ReloadConfig                            => self.reload_config().await,
+            Command::Shutdown                                => self.shutdown().await,
+            Command::GetRules                                => self.get_rules().await,
         }
     }
 
@@ -69,6 +70,21 @@ impl CommandHandler {
     fn stats(&self) -> CommandResponse {
         let snapshot: LiveStats = self.shared_stats.read().clone();
         CommandResponse::success_with_stats("Live stats snapshot", snapshot)
+    }
+
+    // ── Logs — structured live log ring buffer ────────────────────────────────
+
+    /// Return the structured log ring buffer to the CLI (`rubix-cli logs`).
+    ///
+    /// Identical locking strategy to `stats()`: one read-lock acquisition,
+    /// clone the snapshot, release the lock, then serialise outside the lock.
+    ///
+    /// The full `LiveStats` is returned (not just `recent_logs`) so the CLI
+    /// can display per-level counters from `packet_count`, `block_count`, and
+    /// `alert_count` in the header without a second round trip.
+    fn logs(&self) -> CommandResponse {
+        let snapshot: LiveStats = self.shared_stats.read().clone();
+        CommandResponse::success_with_stats("Live log snapshot", snapshot)
     }
 
     // ── Status ────────────────────────────────────────────────────────────────
@@ -115,7 +131,7 @@ impl CommandHandler {
 
         match result {
             Ok(rule_id) => {
-                let _ = reason; // stored inside BlockRule in the blocker
+                let _ = reason;
                 let desc = match duration_secs.filter(|&d| d > 0) {
                     Some(secs) => {
                         let h = secs / 3600;

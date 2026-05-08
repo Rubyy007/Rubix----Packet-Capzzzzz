@@ -19,11 +19,30 @@ blocking:
   block_timeout_seconds: 3600
   default_action: "drop"
   auto_cleanup: true
-  # iptables_chain not applicable on Windows — WFP handles enforcement
 
 logging:
   level: "info"
-  file_path: "C:\\ProgramData\\rubix\\rubix.log"
+  file_path: "C:\\ProgramData\\rubix\\logs\\rubix.log"
   json_format: true
   max_file_size_mb: 100
   rotation_count: 5
+
+  # ── Normal-traffic logging ──────────────────────────────────────────────
+  #
+  # Set log_normal_traffic: true to see all allowed packets in:
+  #   rubix-cli logs --ring normal
+  #   C:\ProgramData\rubix\logs\traffic.log
+  #
+  # normal_sample_divisor controls how many packets are sampled:
+  #   1   = every allowed packet (full capture — high volume)
+  #   10  = 1-in-10 (10%)
+  #   100 = 1-in-100 (1%) — default, low overhead
+  #
+  # normal_ring_capacity: how many entries the in-memory ring holds (1–2048).
+  # normal_channel_depth: async writer queue depth. If the writer falls
+  #   behind, excess entries are silently dropped (hot path never blocks).
+  #
+  log_normal_traffic: true
+  normal_sample_divisor: 100
+  normal_ring_capacity: 200
+  normal_channel_depth: 4096

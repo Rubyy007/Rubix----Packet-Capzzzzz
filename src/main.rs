@@ -24,7 +24,10 @@ use capture::filter::FilterBuilder;
 use logger::AlertLogger;
 use control::{CommandHandler, ControlServer};
 use resolver::{ProcessResolver, FlowKey, Protocol};
-use types::stats::{LiveStats, ProcStatSnapshot};
+use types::stats::{
+    LiveStats, LogEntry, LogLevel,
+    ProcStatSnapshot, LOG_RING_CAPACITY, DEFAULT_NORMAL_RING_CAPACITY,
+};
 
 use parking_lot::RwLock;
 use std::sync::Arc;
@@ -35,16 +38,13 @@ use tokio::time::{Duration, timeout, sleep};
 use tracing::{info, warn, error};
 
 // ── Platform constants ────────────────────────────────────────────────────────
+
 #[cfg(target_os = "linux")]
 const OS_NAME: &str = "linux";
 #[cfg(target_os = "windows")]
 const OS_NAME: &str = "windows";
 
 // ── Per-process statistics (packet-loop-private) ──────────────────────────────
-//
-// Separated into window counters (reset every 5 s) and lifetime totals.
-// Only window counters are published to the CLI table — lifetime totals are
-// used to decide whether a process entry should survive cleanup.
 
 #[derive(Clone)]
 struct ProcStats {
@@ -56,12 +56,11 @@ struct ProcStats {
     blocked:  u64,
     alerted:  u64,
 
-    // Unique sets — kept for the window; not reset (used for DST/PRO columns)
     unique_dsts: HashSet<IpAddr>,
     unique_srcs: HashSet<IpAddr>,
     protocols:   HashSet<String>,
 
-    // Lifetime totals — never reset; used for cleanup heuristics
+    // Lifetime totals — never reset
     total_packets: u64,
     total_blocked: u64,
     total_alerted: u64,
@@ -85,15 +84,12 @@ impl ProcStats {
         }
     }
 
-    /// Reset the 5-second window counters; leave lifetime totals untouched.
     #[inline]
     fn reset_window(&mut self) {
         self.packets = 0;
         self.bytes   = 0;
         self.blocked = 0;
         self.alerted = 0;
-        // Sets are NOT cleared — they represent "seen in last window" which
-        // is still valid for the duration calculation between resets.
     }
 }
 
@@ -112,8 +108,6 @@ impl Heartbeat {
     #[inline]
     fn push(&mut self, pps: f64) {
         if self.samples.len() >= self.capacity {
-            // Remove front is O(n) but n=30 — acceptable; avoids heap churn
-            // of a VecDeque for such a tiny buffer.
             self.samples.remove(0);
         }
         self.samples.push(pps);
@@ -218,7 +212,7 @@ fn build_bpf_filter(
     Some(filter)
 }
 
-// ── Startup banner (shown exactly once, then total silence) ───────────────────
+// ── Startup banner ────────────────────────────────────────────────────────────
 
 pub async fn print_banner(
     config:          &config::RubixConfig,
@@ -270,6 +264,13 @@ pub async fn print_banner(
     println!("│ Control Socket : {:<43} │", "/var/run/rubix.sock");
     #[cfg(windows)]
     println!("│ Control Socket : {:<43} │", "127.0.0.1:9876");
+    sleep(Duration::from_millis(120)).await;
+    println!("│ Normal Logging : {:<43} │",
+        if config.logging.log_normal_traffic {
+            format!("ENABLED (1-in-{} sampling)", config.logging.normal_sample_divisor)
+        } else {
+            "DISABLED (set log_normal_traffic: true to enable)".to_string()
+        });
     println!("└──────────────────────────────────────────────────────────────┘");
     println!();
 
@@ -339,6 +340,8 @@ pub async fn print_banner(
 
     println!("[*] RUBIX ACTIVE — monitoring on {} (Ctrl+C to stop)", interface_label);
     println!("[*] Run 'rubix-cli monitor' in another terminal for live stats");
+    println!("[*] Run 'rubix-cli logs' in another terminal for live log stream");
+    println!("[*] Run 'rubix-cli logs --ring normal' for normal traffic log");
     println!();
 }
 
@@ -362,27 +365,130 @@ fn is_private_ip(ip: IpAddr) -> bool {
     }
 }
 
+// ── Security log ring push ────────────────────────────────────────────────────
+//
+// Called at most once per security-relevant packet (Block, Alert, Threat).
+// Normal (Allow) traffic uses `push_normal_entry` below.
+// String clamping happens here before the LogEntry is constructed.
+
+#[inline]
+fn push_log_entry(
+    recent_logs: &mut Vec<LogEntry>,
+    level:       LogLevel,
+    src_ip:      &str,
+    dst_ip:      &str,
+    src_port:    u16,
+    dst_port:    u16,
+    proto:       &str,
+    process:     &str,
+    detail:      &str,
+) {
+    let time = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+
+    let process: String = if process.len() > 32 {
+        process.chars().take(32).collect()
+    } else {
+        process.to_string()
+    };
+    let detail: String = if detail.len() > 64 {
+        detail.chars().take(64).collect()
+    } else {
+        detail.to_string()
+    };
+
+    let entry = LogEntry {
+        time,
+        level,
+        src_ip:   src_ip.to_string(),
+        dst_ip:   dst_ip.to_string(),
+        src_port,
+        dst_port,
+        proto:    proto.to_string(),
+        process,
+        detail,
+    };
+
+    if recent_logs.len() >= LOG_RING_CAPACITY {
+        recent_logs.remove(0);
+    }
+    recent_logs.push(entry);
+}
+
+// ── Normal / app log ring push ────────────────────────────────────────────────
+//
+// Called from the Allow arm when normal-traffic logging is enabled.
+// `normal_ring_capacity` is read from config at startup and stored
+// as a plain `usize` in the packet loop — zero indirection in the hot path.
+// Error entries (LogLevel::Error) bypass the sampling gate and are always
+// pushed here.
+
+#[inline]
+fn push_normal_entry(
+    normal_logs:          &mut Vec<LogEntry>,
+    normal_ring_capacity: usize,
+    level:                LogLevel,
+    src_ip:               &str,
+    dst_ip:               &str,
+    src_port:             u16,
+    dst_port:             u16,
+    proto:                &str,
+    process:              &str,
+    detail:               &str,
+) {
+    let time = chrono::Local::now().format("%H:%M:%S%.3f").to_string();
+
+    let process: String = if process.len() > 32 {
+        process.chars().take(32).collect()
+    } else {
+        process.to_string()
+    };
+    let detail: String = if detail.len() > 64 {
+        detail.chars().take(64).collect()
+    } else {
+        detail.to_string()
+    };
+
+    let entry = LogEntry {
+        time,
+        level,
+        src_ip:   src_ip.to_string(),
+        dst_ip:   dst_ip.to_string(),
+        src_port,
+        dst_port,
+        proto:    proto.to_string(),
+        process,
+        detail,
+    };
+
+    if normal_logs.len() >= normal_ring_capacity {
+        normal_logs.remove(0);
+    }
+    normal_logs.push(entry);
+}
+
 // ── Stats publisher ───────────────────────────────────────────────────────────
 //
 // Called from the packet loop every ~500 ms.
 // Uses try_write() so the hot path is never blocked by a CLI reader.
-// If the lock is contended, we simply skip this publish cycle — the CLI
-// receives data that is at most one extra interval stale (≤1 s total).
 
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn publish_stats(
-    shared:         &Arc<RwLock<LiveStats>>,
-    packet_count:   u64,
-    block_count:    u64,
-    alert_count:    u64,
-    pps:            f64,
-    avg_pps:        f64,
-    runtime_secs:   f64,
-    wave:           String,
-    proc_stats:     &HashMap<u32, ProcStats>,
-    recent_threats: &VecDeque<String>,
+    shared:               &Arc<RwLock<LiveStats>>,
+    packet_count:         u64,
+    block_count:          u64,
+    alert_count:          u64,
+    pps:                  f64,
+    avg_pps:              f64,
+    runtime_secs:         f64,
+    wave:                 String,
+    proc_stats:           &HashMap<u32, ProcStats>,
+    recent_threats:       &VecDeque<String>,
+    recent_logs:          &Vec<LogEntry>,
+    normal_logs:          &Vec<LogEntry>,
+    normal_logging_enabled: bool,
+    normal_sample_divisor:  u64,
 ) {
-    // Build top-8 snapshot — sorted by blocked → alerted → packets
     let mut top: Vec<ProcStatSnapshot> = proc_stats
         .iter()
         .filter(|(_, s)| s.total_packets > 0 || s.total_blocked > 0 || s.total_alerted > 0)
@@ -407,19 +513,21 @@ fn publish_stats(
 
     let threats: Vec<String> = recent_threats.iter().cloned().collect();
 
-    // try_write: if a CLI reader holds the lock we skip — never block the loop
     if let Some(mut guard) = shared.try_write() {
-        guard.packet_count   = packet_count;
-        guard.block_count    = block_count;
-        guard.alert_count    = alert_count;
-        guard.pps            = pps;
-        guard.avg_pps        = avg_pps;
-        guard.runtime_secs   = runtime_secs;
-        guard.heartbeat      = wave;
-        guard.top_procs      = top;
-        guard.recent_threats = threats;
+        guard.packet_count             = packet_count;
+        guard.block_count              = block_count;
+        guard.alert_count              = alert_count;
+        guard.pps                      = pps;
+        guard.avg_pps                  = avg_pps;
+        guard.runtime_secs             = runtime_secs;
+        guard.heartbeat                = wave;
+        guard.top_procs                = top;
+        guard.recent_threats           = threats;
+        guard.recent_logs              = recent_logs.clone();
+        guard.normal_logs              = normal_logs.clone();
+        guard.normal_logging_enabled   = normal_logging_enabled;
+        guard.normal_sample_divisor    = normal_sample_divisor;
     }
-    // else: silently skip — next publish is ≤500 ms away
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────
@@ -435,6 +543,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config_dir    = std::path::Path::new("configs");
     let config_loader = ConfigLoader::load(config_dir, OS_NAME)?;
     let config        = config_loader.get();
+
+    // ── Re-init AlertLogger with config-driven parameters ─────────────────────
+    // Logger::init_dual() already called AlertLogger::init() with safe defaults.
+    // Now that config is loaded, upgrade to config-driven channel depth and
+    // file size limits.  init_with_config is guarded against double-init.
+    AlertLogger::init_with_config(
+        config.logging.normal_channel_depth,
+        config.logging.max_file_size_mb,
+    )?;
+
+    // Capture normal-traffic config into hot-path locals — zero indirection.
+    let log_normal:           bool  = config.logging.log_normal_traffic;
+    let normal_sample_divisor: u64  = config.logging.normal_sample_divisor.max(1);
+    let normal_ring_capacity: usize = config.logging.normal_ring_capacity
+        .max(1)
+        .min(2048); // hard cap — prevents misconfiguration OOM
 
     // ── Policy engine ─────────────────────────────────────────────────────────
     let policy_engine = Arc::new(PolicyEngine::new());
@@ -491,16 +615,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let bpf_filter         = build_bpf_filter(&config.bpf_filter, &malicious_ips);
     let bpf_filter_display = bpf_filter.as_deref().unwrap_or("none").to_string();
 
-    // ── Banner — printed once, then silence ───────────────────────────────────
+    // ── Banner ────────────────────────────────────────────────────────────────
     print_banner(
         &config, rules_count, kernel_rules,
         &interface_name, &interface_label,
         &bpf_filter_display, &malicious_ips,
     ).await;
 
-    // ── Shared live stats — parking_lot RwLock ────────────────────────────────
-    // Arc<RwLock<T>> with parking_lot: readers never block each other,
-    // writers use try_write so the hot path is never stalled.
+    // ── Shared live stats ─────────────────────────────────────────────────────
     let shared_stats: Arc<RwLock<LiveStats>> = Arc::new(RwLock::new(LiveStats::default()));
 
     // ── Capture ───────────────────────────────────────────────────────────────
@@ -521,7 +643,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         policy_engine.clone(),
         reloader.clone(),
         start_time,
-        shared_stats.clone(),   // handler gets a reader handle
+        shared_stats.clone(),
     ));
     let ctrl_server = ControlServer::new(ctrl_handler);
     ctrl_server.start().await;
@@ -538,12 +660,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ─────────────────────────────────────────────────────────────────────────
-    //  PACKET LOOP — hot path, completely silent on stdout.
-    //
-    //  Nothing writes to stdout/stderr inside this loop.
-    //  • AlertLogger writes to the log file only.
-    //  • Threat events go into `recent_threats` deque.
-    //  • All metrics go into `shared_stats` via publish_stats().
+    //  PACKET LOOP
     // ─────────────────────────────────────────────────────────────────────────
 
     let mut packet_count:      u64 = 0;
@@ -553,21 +670,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut last_packet_count: u64 = 0;
     let mut last_window_reset      = start_time;
 
-    let mut heartbeat  = Heartbeat::new(30);
+    // Sampling counter for normal-traffic logging.
+    // Incremented on every Allow packet; reset to 0 when it reaches
+    // `normal_sample_divisor`.  Pure integer arithmetic — no float division
+    // in the hot path.
+    let mut normal_sample_counter: u64 = 0;
+
+    let mut heartbeat    = Heartbeat::new(30);
     let mut proc_stats: HashMap<u32, ProcStats> = HashMap::with_capacity(128);
     let mut threat_tracker = ThreatTracker::new();
 
-    // Pre-formatted threat strings — newest last, capped at 20.
-    let mut recent_threats: VecDeque<String> = VecDeque::with_capacity(20);
+    let mut recent_threats: VecDeque<String>  = VecDeque::with_capacity(20);
+    let mut recent_logs:    Vec<LogEntry>     = Vec::with_capacity(LOG_RING_CAPACITY);
+    let mut normal_logs:    Vec<LogEntry>     = Vec::with_capacity(normal_ring_capacity);
 
     while running.load(Ordering::Relaxed) {
         match timeout(Duration::from_millis(100), capture.next_packet()).await {
 
-            // ── Packet received ───────────────────────────────────────────────
             Ok(Some(packet)) => {
                 packet_count += 1;
 
-                // ── HOT PATH: process resolution ──────────────────────────────
+                // ── Process resolution ────────────────────────────────────────
                 let proto = Protocol::from_str(&packet.protocol.to_string());
 
                 let proc_info = resolver.lookup(&FlowKey {
@@ -620,13 +743,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 };
 
                 if let Some(ref threat) = threat {
-                    // Log to file — NO stdout
                     AlertLogger::log_block(
                         &threat.src_ip.to_string(), "local", 0, 0, "DETECT",
                         &format!("{}:{}", threat.kind.as_str(), threat.detail),
                     );
 
-                    // Store formatted for CLI display
                     let line = format!(
                         "{} {} | src={} | {}",
                         threat.severity.icon(),
@@ -636,6 +757,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                     if recent_threats.len() == 20 { recent_threats.pop_front(); }
                     recent_threats.push_back(line);
+
+                    push_log_entry(
+                        &mut recent_logs,
+                        LogLevel::Threat,
+                        &threat.src_ip.to_string(),
+                        "local",
+                        0,
+                        0,
+                        "DETECT",
+                        proc_info.as_ref().map(|p| p.name.as_str()).unwrap_or("unknown"),
+                        &format!("{}:{}", threat.kind.as_str(), threat.detail),
+                    );
 
                     alert_count += 1;
 
@@ -647,7 +780,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // Periodic eviction of stale tracker buckets
+                // Periodic threat-tracker eviction
                 if packet_count % 1_000 == 0 {
                     threat_tracker.maybe_evict();
                 }
@@ -664,7 +797,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             }
                         }
 
-                        // Log to file — NO stdout
                         let proc_label = proc_info.as_ref()
                             .map(|p| format!("{}({})", p.name, p.pid))
                             .unwrap_or_else(|| "unknown".into());
@@ -674,6 +806,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             packet.src_port,
                             packet.dst_port,
                             &packet.protocol.to_string(),
+                            &format!("proc={}", proc_label),
+                        );
+
+                        push_log_entry(
+                            &mut recent_logs,
+                            LogLevel::Block,
+                            &packet.src_ip.to_string(),
+                            &packet.dst_ip.to_string(),
+                            packet.src_port,
+                            packet.dst_port,
+                            &packet.protocol.to_string(),
+                            proc_info.as_ref().map(|p| p.name.as_str()).unwrap_or("unknown"),
                             &format!("proc={}", proc_label),
                         );
                     }
@@ -699,12 +843,70 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             &packet.protocol.to_string(),
                             &format!("proc={}", proc_label),
                         );
+
+                        push_log_entry(
+                            &mut recent_logs,
+                            LogLevel::Alert,
+                            &packet.src_ip.to_string(),
+                            &packet.dst_ip.to_string(),
+                            packet.src_port,
+                            packet.dst_port,
+                            &packet.protocol.to_string(),
+                            proc_info.as_ref().map(|p| p.name.as_str()).unwrap_or("unknown"),
+                            &format!("proc={}", proc_label),
+                        );
                     }
 
-                    RuleAction::Allow => { /* hot path — intentionally empty */ }
+                    // ── Normal (Allow) traffic ────────────────────────────────
+                    //
+                    // Hot path.  Only enters the logging branches when
+                    // `log_normal` is true — the `if` is branch-predicted
+                    // almost always not-taken, so normal operation has zero
+                    // overhead here.
+                    //
+                    // Sampling: increment counter; log when it hits zero
+                    // (modulo normal_sample_divisor).  Integer modulo, no
+                    // float, no RNG.
+                    RuleAction::Allow => {
+                        if log_normal {
+                            normal_sample_counter += 1;
+                            if normal_sample_counter >= normal_sample_divisor {
+                                normal_sample_counter = 0;
+
+                                let proc_name_str = proc_info
+                                    .as_ref()
+                                    .map(|p| p.name.as_str())
+                                    .unwrap_or("unknown");
+
+                                // Non-blocking channel send — file writer.
+                                AlertLogger::log_normal(
+                                    &packet.src_ip.to_string(),
+                                    &packet.dst_ip.to_string(),
+                                    packet.src_port,
+                                    packet.dst_port,
+                                    &packet.protocol.to_string(),
+                                    proc_name_str,
+                                );
+
+                                // In-memory ring — separate from security ring.
+                                push_normal_entry(
+                                    &mut normal_logs,
+                                    normal_ring_capacity,
+                                    LogLevel::Normal,
+                                    &packet.src_ip.to_string(),
+                                    &packet.dst_ip.to_string(),
+                                    packet.src_port,
+                                    packet.dst_port,
+                                    &packet.protocol.to_string(),
+                                    proc_name_str,
+                                    "allow",
+                                );
+                            }
+                        }
+                    }
                 }
 
-                // ── Stats publish (every ~500 ms, no I/O) ────────────────────
+                // ── Stats publish (every ~500 ms) ─────────────────────────────
                 let check_interval = if packet_count < 1_000 { 50 } else { 500 };
 
                 if packet_count % check_interval == 0 {
@@ -727,13 +929,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             heartbeat.render(),
                             &proc_stats,
                             &recent_threats,
+                            &recent_logs,
+                            &normal_logs,
+                            log_normal,
+                            normal_sample_divisor,
                         );
 
-                        // 5-second window reset
                         if now.duration_since(last_window_reset).as_secs() >= 5 {
                             for s in proc_stats.values_mut() { s.reset_window(); }
 
-                            // Trim stale entries: keep processes seen at least once
                             if proc_stats.len() > 64 {
                                 proc_stats.retain(|_, s| s.total_packets > 0);
                             }
@@ -747,7 +951,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // ── Quiet period (no packets) ─────────────────────────────────────
             Ok(None) => {
                 let now = std::time::Instant::now();
 
@@ -764,6 +967,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         heartbeat.render(),
                         &proc_stats,
                         &recent_threats,
+                        &recent_logs,
+                        &normal_logs,
+                        log_normal,
+                        normal_sample_divisor,
                     );
 
                     last_stats_time = now;
@@ -772,14 +979,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sleep(Duration::from_micros(100)).await;
             }
 
-            // ── 100 ms timeout — just continue ───────────────────────────────
             Err(_) => continue,
         }
     }
 
-    // ─────────────────────────────────────────────────────────────────────────
-    //  GRACEFUL SHUTDOWN
-    // ─────────────────────────────────────────────────────────────────────────
+    // ── Graceful shutdown ─────────────────────────────────────────────────────
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════════╗");
