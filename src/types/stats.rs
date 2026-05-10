@@ -22,14 +22,17 @@
 //!                  traffic can never evict Block/Alert/Threat entries.
 //!
 //! The CLI `rubix-cli logs` command receives the full LiveStats snapshot
-//! (both rings) and applies its own `--ring` / `--filter` flags client-side.
+//! (both rings) and applies its own ring / filter selection client-side.
 
 use serde::{Deserialize, Serialize};
 
 // ── Log severity / category ───────────────────────────────────────────────────
 
 /// The event categories used by both log rings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Hash` is derived so that `LogLevel` can be used as a field in the CLI's
+/// `EntryKey` dedup struct, which itself derives `Hash` for use in a `HashSet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum LogLevel {
     /// Packet explicitly blocked by a policy rule.
