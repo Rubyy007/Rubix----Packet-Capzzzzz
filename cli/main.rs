@@ -4,24 +4,32 @@
 //! ## Subcommands
 //!
 //! ```text
-//! rubix-cli start                        Start the daemon
-//! rubix-cli start --foreground           Start in foreground
-//! rubix-cli stop                         Graceful stop
-//! rubix-cli stop --force                 Force kill
-//! rubix-cli status                       Daemon status + uptime
-//! rubix-cli block <IP>                   Block IP permanently
-//! rubix-cli block <IP> --duration 3600   Block IP for 1 hour
-//! rubix-cli unblock <IP>                 Remove a block
-//! rubix-cli list                         List active blocks
-//! rubix-cli rules                        List policy rules
-//! rubix-cli reload                       Hot-reload rules from disk
-//! rubix-cli monitor                      Live TUI dashboard (Ctrl+C to exit)
-//! rubix-cli logs                         All rings, all levels — live stream
-//! rubix-cli logs alerts                  Security ring, Alert level — live stream
-//! rubix-cli logs blocks                  Security ring, Block level — live stream
-//! rubix-cli logs threats                 Security ring, Threat level — live stream
-//! rubix-cli logs normal                  Normal ring, Normal level — live stream
-//! rubix-cli logs errors                  Normal ring, Error level — live stream
+//! rubix-cli start                                     Start the daemon
+//! rubix-cli start --foreground                        Start in foreground
+//! rubix-cli stop                                      Graceful stop
+//! rubix-cli stop --force                              Force kill
+//! rubix-cli status                                    Daemon status + uptime
+//! rubix-cli block <IP>                                Block IP permanently
+//! rubix-cli block <IP> --duration 3600                Block IP for 1 hour
+//! rubix-cli unblock <IP>                              Remove an IP block
+//! rubix-cli list                                      List active IP blocks
+//! rubix-cli block-pid <PID>                           Block process by PID permanently
+//! rubix-cli block-pid <PID> --duration 300            Block PID for 5 minutes
+//! rubix-cli block-exe <PATH>                          Block all processes from executable
+//! rubix-cli block-hash <SHA256>                       Block by executable SHA-256
+//! rubix-cli unblock-pid <PID>                         Remove PID block + flush kernel IPs
+//! rubix-cli unblock-exe <PATH>                        Remove executable block
+//! rubix-cli unblock-hash <SHA256>                     Remove hash block
+//! rubix-cli list-processes                            List all process blocks
+//! rubix-cli rules                                     List policy rules
+//! rubix-cli reload                                    Hot-reload rules from disk
+//! rubix-cli monitor                                   Live TUI dashboard (Ctrl+C to exit)
+//! rubix-cli logs                                      All rings, all levels — live stream
+//! rubix-cli logs alerts                               Security ring, Alert level
+//! rubix-cli logs blocks                               Security ring, Block level
+//! rubix-cli logs threats                              Security ring, Threat level
+//! rubix-cli logs normal                               Normal ring, Normal level
+//! rubix-cli logs errors                               Normal ring, Error level
 //! ```
 //!
 //! ## Log output format
@@ -32,23 +40,6 @@
 //! [BLOCK]  14:03:22.441  192.168.1.5:4444 -> 10.0.0.1:80    TCP    curl
 //! [ALERT]  14:03:23.001  10.1.2.3:0       -> 8.8.8.8:53     UDP    systemd-resolve
 //! ```
-//!
-//! Color codes (stripped automatically when stdout is not a TTY):
-//!   BLOCK  → bold red       \x1B[1;31m
-//!   ALERT  → bold yellow    \x1B[1;33m
-//!   THREAT → bold magenta   \x1B[1;35m
-//!   NORMAL → white          \x1B[0;37m
-//!   ERROR  → bold light-red \x1B[1;91m
-//!
-//! ## Live streaming
-//!
-//! All `logs` subcommands poll the daemon every POLL_INTERVAL_MS milliseconds.
-//! Only entries whose (time, src_ip, dst_ip, level) tuple has not been printed
-//! in the current session are emitted — there is no duplicate output even if
-//! the daemon's ring buffer overlaps between polls.
-//!
-//! Ctrl+C exits immediately and cleanly via a standard signal handler; no raw
-//! terminal mode is used, so the terminal is never left in a broken state.
 //!
 //! ## Windows ANSI
 //!
@@ -67,7 +58,6 @@ use rubix::types::stats::{LiveStats, LogEntry, LogLevel};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-/// How often we poll the daemon for new log entries (milliseconds).
 const POLL_INTERVAL_MS: u64 = 1_000;
 
 // ── Platform: socket address ──────────────────────────────────────────────────
@@ -87,12 +77,14 @@ const MAX_THREAT_ROWS: usize = 5;
 // ── ANSI color constants ──────────────────────────────────────────────────────
 
 const COLOR_RESET:  &str = "\x1B[0m";
-const COLOR_BLOCK:  &str = "\x1B[1;31m";   // bold red
-const COLOR_ALERT:  &str = "\x1B[1;33m";   // bold yellow
-const COLOR_THREAT: &str = "\x1B[1;35m";   // bold magenta
-const COLOR_NORMAL: &str = "\x1B[0;37m";   // white
-const COLOR_ERROR:  &str = "\x1B[1;91m";   // bold bright-red
+const COLOR_BLOCK:  &str = "\x1B[1;31m";
+const COLOR_ALERT:  &str = "\x1B[1;33m";
+const COLOR_THREAT: &str = "\x1B[1;35m";
+const COLOR_NORMAL: &str = "\x1B[0;37m";
+const COLOR_ERROR:  &str = "\x1B[1;91m";
 const COLOR_DIM:    &str = "\x1B[2m";
+const COLOR_CYAN:   &str = "\x1B[1;36m";
+const COLOR_GREEN:  &str = "\x1B[1;32m";
 
 // ── CLI definition ────────────────────────────────────────────────────────────
 
@@ -103,25 +95,39 @@ const COLOR_DIM:    &str = "\x1B[2m";
 #[command(long_about = "
 RUBIX Network Defense Engine CLI
 
-Examples:
-  rubix-cli start                            Start the daemon
-  rubix-cli start --foreground               Start in foreground
-  rubix-cli stop                             Stop the daemon (graceful)
-  rubix-cli stop --force                     Force kill immediately
-  rubix-cli status                           Show daemon status and uptime
-  rubix-cli block 185.230.125.100            Block IP permanently
-  rubix-cli block 1.2.3.4 --duration 3600   Block IP for 1 hour
-  rubix-cli unblock 1.2.3.4                  Remove a block
-  rubix-cli list                             List all active blocks
-  rubix-cli rules                            List all policy rules
-  rubix-cli reload                           Reload rules from disk
-  rubix-cli monitor                          Live TUI dashboard (Ctrl+C to exit)
-  rubix-cli logs                             Live stream — all rings, all levels
-  rubix-cli logs alerts                      Live stream — Alert level only
-  rubix-cli logs blocks                      Live stream — Block level only
-  rubix-cli logs threats                     Live stream — Threat level only
-  rubix-cli logs normal                      Live stream — Normal level only
-  rubix-cli logs errors                      Live stream — Error level only
+── IP BLOCKING ───────────────────────────────────────────────────────────────
+  rubix-cli block 185.230.125.100                  Block IP permanently
+  rubix-cli block 1.2.3.4 --duration 3600          Block IP for 1 hour
+  rubix-cli unblock 1.2.3.4                         Remove IP block
+  rubix-cli list                                    List active IP blocks
+
+── PROCESS BLOCKING ──────────────────────────────────────────────────────────
+  rubix-cli block-pid 1234                          Block PID permanently
+  rubix-cli block-pid 1234 --duration 300           Block PID for 5 minutes
+  rubix-cli block-exe /usr/bin/curl                 Block all curl processes
+  rubix-cli block-hash aabb1122...                  Block by SHA-256 hash
+  rubix-cli unblock-pid 1234                        Remove PID block
+  rubix-cli unblock-exe /usr/bin/curl               Remove executable block
+  rubix-cli unblock-hash aabb1122...                Remove hash block
+  rubix-cli list-processes                          List all process blocks
+
+── DAEMON ────────────────────────────────────────────────────────────────────
+  rubix-cli start                                   Start the daemon
+  rubix-cli start --foreground                      Start in foreground
+  rubix-cli stop                                    Stop gracefully
+  rubix-cli stop --force                            Force kill
+  rubix-cli status                                  Show status + uptime
+  rubix-cli rules                                   List policy rules
+  rubix-cli reload                                  Reload rules.yaml
+
+── MONITORING ────────────────────────────────────────────────────────────────
+  rubix-cli monitor                                 Live TUI dashboard
+  rubix-cli logs                                    Stream all events
+  rubix-cli logs blocks                             Stream Block events only
+  rubix-cli logs alerts                             Stream Alert events only
+  rubix-cli logs threats                            Stream Threat events only
+  rubix-cli logs normal                             Stream normal traffic
+  rubix-cli logs errors                             Stream daemon errors
 ")]
 struct Cli {
     #[command(subcommand)]
@@ -145,20 +151,102 @@ enum Commands {
     /// Show daemon status, uptime, and active rule counts
     Status,
 
-    /// Block an IP address
+    /// Block an IP address permanently or for a timed duration
     Block {
         ip: String,
-        #[arg(short, long, default_value = "0")]
+        #[arg(short, long, default_value = "0", help = "Duration in seconds (0 = permanent)")]
         duration: u64,
-        #[arg(short, long)]
+        #[arg(short, long, help = "Optional reason label")]
         reason: Option<String>,
     },
 
-    /// Remove a block rule
-    Unblock { ip: String },
+    /// Remove an IP block rule
+    Unblock {
+        ip: String,
+    },
 
-    /// List all active block rules
+    /// List all active IP block rules
     List,
+
+    // ── Process blocking ──────────────────────────────────────────────────────
+
+    /// Block a specific running process by PID.
+    ///
+    /// The block is immediate and auto-expires when the process exits
+    /// or the optional duration elapses. When a packet from this PID
+    /// is seen, the remote IP is automatically kernel-blocked and tagged
+    /// with this PID as the origin. unblock-pid flushes those kernel IPs.
+    ///
+    /// Examples:
+    ///   rubix-cli block-pid 1234
+    ///   rubix-cli block-pid 1234 --duration 300
+    ///   rubix-cli block-pid 1234 --reason "data exfil suspect"
+    BlockPid {
+        pid: u32,
+        #[arg(short, long, default_value = "0", help = "Duration in seconds (0 = permanent until PID exits)")]
+        duration: u64,
+        #[arg(short, long, help = "Optional reason label")]
+        reason: Option<String>,
+    },
+
+    /// Block all processes launched from an executable path.
+    ///
+    /// The path is canonicalized at registration time (symlinks resolved).
+    /// All currently running instances are PID-blocked immediately.
+    /// Any new process launched from this path is auto-blocked on first packet.
+    ///
+    /// Examples:
+    ///   rubix-cli block-exe /usr/bin/curl
+    ///   rubix-cli block-exe "C:\Windows\System32\curl.exe"
+    ///   rubix-cli block-exe /usr/bin/python3 --reason "malware dropper"
+    BlockExe {
+        path: String,
+        #[arg(short, long, help = "Optional reason label")]
+        reason: Option<String>,
+    },
+
+    /// Block any process whose executable SHA-256 matches.
+    ///
+    /// Hash-based blocking survives the binary being renamed or moved.
+    /// The sha256 argument must be exactly 64 lowercase hex characters.
+    ///
+    /// Get the hash:
+    ///   Windows: (Get-FileHash payload.exe -Algorithm SHA256).Hash.ToLower()
+    ///   Linux:   sha256sum /path/to/binary
+    ///
+    /// Examples:
+    ///   rubix-cli block-hash aabbcc1122...64chars
+    ///   rubix-cli block-hash aabbcc1122...64chars --reason "known malware"
+    BlockHash {
+        sha256: String,
+        #[arg(short, long, help = "Optional reason label")]
+        reason: Option<String>,
+    },
+
+    /// Remove a PID block and flush all kernel IP rules installed for it.
+    ///
+    /// Kernel IP rules that were automatically installed because of this
+    /// PID block are also removed from nftables/WFP.
+    UnblockPid {
+        pid: u32,
+    },
+
+    /// Remove an executable path block.
+    ///
+    /// Existing PID blocks derived from this exe block remain active until
+    /// the process exits or you explicitly unblock-pid them.
+    UnblockExe {
+        path: String,
+    },
+
+    /// Remove a SHA-256 hash block.
+    UnblockHash {
+        /// 64-character lowercase hex SHA-256
+        sha256: String,
+    },
+
+    /// List all active process blocks: PIDs, executables, and hashes.
+    ListProcesses,
 
     /// List all loaded policy rules
     Rules,
@@ -170,58 +258,37 @@ enum Commands {
     Monitor,
 
     /// Live log stream — raw text, one line per entry (Ctrl+C to exit)
-    ///
-    /// Subcommands narrow to a specific level. Without a subcommand all
-    /// rings and all levels are streamed.
-    ///
-    ///   rubix-cli logs            All rings, all levels
-    ///   rubix-cli logs alerts     Security ring, Alert level
-    ///   rubix-cli logs blocks     Security ring, Block level
-    ///   rubix-cli logs threats    Security ring, Threat level
-    ///   rubix-cli logs normal     Normal ring, Normal level
-    ///   rubix-cli logs errors     Normal ring, Error level
     #[command(subcommand)]
     Logs(LogsCommand),
 }
 
-/// Logs subcommands — each selects a specific ring + level filter.
-/// `rubix-cli logs` with no subcommand maps to `LogsCommand::All`.
+// ── Logs subcommands ──────────────────────────────────────────────────────────
+
 #[derive(Subcommand, Debug, Clone, Copy)]
 enum LogsCommand {
-    /// All rings, all levels (default when no subcommand is given)
     #[command(hide = true)]
     All,
-
     /// Security ring — Alert level only
     Alerts,
-
     /// Security ring — Block level only
     Blocks,
-
     /// Security ring — Threat level only
     Threats,
-
     /// Normal ring — Normal level only
     Normal,
-
     /// Normal ring — Error level only
     Errors,
 }
 
 // ── Log stream configuration ──────────────────────────────────────────────────
 
-/// Which daemon rings to merge for a given logs subcommand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Ring {
-    /// `s.recent_logs` only (security events: Block, Alert, Threat)
     Security,
-    /// `s.normal_logs` only (Normal, Error)
     Normal,
-    /// Both rings merged
     Both,
 }
 
-/// The resolved streaming configuration derived from a `LogsCommand`.
 #[derive(Debug, Clone, Copy)]
 struct LogStreamConfig {
     ring:   Ring,
@@ -231,12 +298,12 @@ struct LogStreamConfig {
 impl From<LogsCommand> for LogStreamConfig {
     fn from(cmd: LogsCommand) -> Self {
         match cmd {
-            LogsCommand::All     => Self { ring: Ring::Both,     filter: None                    },
-            LogsCommand::Alerts  => Self { ring: Ring::Security, filter: Some(LogLevel::Alert)   },
-            LogsCommand::Blocks  => Self { ring: Ring::Security, filter: Some(LogLevel::Block)   },
-            LogsCommand::Threats => Self { ring: Ring::Security, filter: Some(LogLevel::Threat)  },
-            LogsCommand::Normal  => Self { ring: Ring::Normal,   filter: Some(LogLevel::Normal)  },
-            LogsCommand::Errors  => Self { ring: Ring::Normal,   filter: Some(LogLevel::Error)   },
+            LogsCommand::All     => Self { ring: Ring::Both,     filter: None                   },
+            LogsCommand::Alerts  => Self { ring: Ring::Security, filter: Some(LogLevel::Alert)  },
+            LogsCommand::Blocks  => Self { ring: Ring::Security, filter: Some(LogLevel::Block)  },
+            LogsCommand::Threats => Self { ring: Ring::Security, filter: Some(LogLevel::Threat) },
+            LogsCommand::Normal  => Self { ring: Ring::Normal,   filter: Some(LogLevel::Normal) },
+            LogsCommand::Errors  => Self { ring: Ring::Normal,   filter: Some(LogLevel::Error)  },
         }
     }
 }
@@ -274,15 +341,11 @@ fn enable_ansi_terminal() {}
 
 // ── Color helpers ─────────────────────────────────────────────────────────────
 
-/// Returns true when stdout is a real TTY that supports ANSI escape codes.
-/// When stdout is piped (e.g. `rubix-cli logs alerts | grep ...`) all color
-/// codes are suppressed automatically.
 #[inline]
 fn use_color() -> bool {
     io::stdout().is_terminal()
 }
 
-/// Return the ANSI color prefix for a log level, or "" when color is off.
 #[inline]
 fn level_color(level: LogLevel) -> &'static str {
     if !use_color() { return ""; }
@@ -295,16 +358,24 @@ fn level_color(level: LogLevel) -> &'static str {
     }
 }
 
-/// Return the ANSI reset sequence, or "" when color is off.
 #[inline]
 fn reset() -> &'static str {
     if use_color() { COLOR_RESET } else { "" }
 }
 
-/// Return the dim sequence, or "" when color is off.
 #[inline]
 fn dim() -> &'static str {
     if use_color() { COLOR_DIM } else { "" }
+}
+
+#[inline]
+fn cyan() -> &'static str {
+    if use_color() { COLOR_CYAN } else { "" }
+}
+
+#[inline]
+fn green() -> &'static str {
+    if use_color() { COLOR_GREEN } else { "" }
 }
 
 // ── Platform: process detection ───────────────────────────────────────────────
@@ -499,17 +570,23 @@ async fn send_command(json: &str) -> Result<serde_json::Value, String> {
 fn print_response(resp: serde_json::Value) {
     let success = resp["success"].as_bool().unwrap_or(false);
     let message = resp["message"].as_str().unwrap_or("(no message)");
-    if success { println!("[+] {}", message); } else { eprintln!("[!] {}", message); }
+    if success {
+        println!("{}[+]{} {}", green(), reset(), message);
+    } else {
+        eprintln!("{}[!]{} {}", COLOR_BLOCK, reset(), message);
+    }
 
     if let Some(data) = resp.get("data") {
+
+        // ── IP block list ─────────────────────────────────────────────────────
         if let Some(rules) = data.get("rules").and_then(|r| r.as_array()) {
             if rules.is_empty() {
                 println!("    (none)");
             } else {
                 println!();
                 println!(
-                    "    {:<20} {:<18} {:<12} {}",
-                    "IP", "Duration", "Type", "Reason"
+                    "{}    {:<20} {:<18} {:<12} {}{}",
+                    dim(), "IP", "Duration", "Type", "Reason", reset()
                 );
                 println!("    {}", "-".repeat(70));
                 for rule in rules {
@@ -528,10 +605,136 @@ fn print_response(resp: serde_json::Value) {
                 println!();
             }
         }
+
+        // ── Status uptime block ───────────────────────────────────────────────
         if let Some(uptime) = data.get("uptime_human") {
-            println!("    Uptime        : {}", uptime.as_str().unwrap_or("-"));
-            println!("    Active blocks : {}", data["active_blocks"].as_u64().unwrap_or(0));
-            println!("    Policy rules  : {}", data["policy_rules"].as_u64().unwrap_or(0));
+            println!("    Uptime           : {}", uptime.as_str().unwrap_or("-"));
+            println!("    Active IP blocks : {}", data["active_ip_blocks"].as_u64().unwrap_or(0));
+            println!("    Active PID blocks: {}", data["active_pid_blocks"].as_u64().unwrap_or(0));
+            println!("    Active exe blocks: {}", data["active_exe_blocks"].as_u64().unwrap_or(0));
+            println!("    Hash blocks      : {}", data["active_hash_blocks"].as_u64().unwrap_or(0));
+            println!("    Policy rules     : {}", data["policy_rules"].as_u64().unwrap_or(0));
+        }
+
+        // ── PID block list ────────────────────────────────────────────────────
+        if let Some(pids) = data.get("pid_blocks").and_then(|r| r.as_array()) {
+            if !pids.is_empty() {
+                println!();
+                println!(
+                    "{}  PID BLOCKS:{}",
+                    cyan(), reset()
+                );
+                println!(
+                    "{}    {:<8} {:<24} {:<12} {:<10} {}{}",
+                    dim(), "PID", "NAME", "EXPIRES", "KERNEL IPs", "REASON", reset()
+                );
+                println!("    {}", "-".repeat(72));
+                for p in pids {
+                    println!(
+                        "    {:<8} {:<24} {:<12} {:<10} {}",
+                        p["pid"].as_u64().unwrap_or(0),
+                        p["name"].as_str().unwrap_or("-"),
+                        p["expires"].as_str().unwrap_or("permanent"),
+                        p["kernel_ips"].as_u64().unwrap_or(0),
+                        p["reason"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+
+        // ── Executable block list ─────────────────────────────────────────────
+        if let Some(exes) = data.get("exe_blocks").and_then(|r| r.as_array()) {
+            if !exes.is_empty() {
+                println!();
+                println!(
+                    "{}  EXECUTABLE BLOCKS:{}",
+                    cyan(), reset()
+                );
+                println!(
+                    "{}    {:<52} {}{}",
+                    dim(), "PATH", "REASON", reset()
+                );
+                println!("    {}", "-".repeat(72));
+                for e in exes {
+                    println!(
+                        "    {:<52} {}",
+                        e["path"].as_str().unwrap_or("-"),
+                        e["reason"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+
+        // ── Hash block list ───────────────────────────────────────────────────
+        if let Some(hashes) = data.get("hash_blocks").and_then(|r| r.as_array()) {
+            if !hashes.is_empty() {
+                println!();
+                println!(
+                    "{}  HASH BLOCKS:{}",
+                    cyan(), reset()
+                );
+                println!(
+                    "{}    {:<68} {}{}",
+                    dim(), "SHA-256", "REASON", reset()
+                );
+                println!("    {}", "-".repeat(80));
+                for h in hashes {
+                    println!(
+                        "    {:<68} {}",
+                        h["sha256"].as_str().unwrap_or("-"),
+                        h["reason"].as_str().unwrap_or("-"),
+                    );
+                }
+            }
+        }
+
+        // ── Single block confirmation ─────────────────────────────────────────
+        if let Some(ip) = data.get("ip") {
+            println!("    IP      : {}", ip.as_str().unwrap_or("-"));
+            if let Some(id) = data.get("rule_id") {
+                println!("    Rule ID : {}", id.as_str().unwrap_or("-"));
+            }
+        }
+
+        // ── Process block confirmation ────────────────────────────────────────
+        if let Some(pid) = data.get("pid") {
+            println!("    PID    : {}", pid.as_u64().unwrap_or(0));
+            if let Some(r) = data.get("reason") {
+                println!("    Reason : {}", r.as_str().unwrap_or("-"));
+            }
+            if let Some(n) = data.get("newly_blocked") {
+                println!("    New    : {}", n.as_bool().unwrap_or(false));
+            }
+        }
+        if let Some(path) = data.get("path") {
+            println!("    Path   : {}", path.as_str().unwrap_or("-"));
+            if let Some(r) = data.get("reason") {
+                println!("    Reason : {}", r.as_str().unwrap_or("-"));
+            }
+        }
+        if let Some(sha) = data.get("sha256") {
+            println!("    SHA256 : {}", sha.as_str().unwrap_or("-"));
+            if let Some(r) = data.get("reason") {
+                println!("    Reason : {}", r.as_str().unwrap_or("-"));
+            }
+        }
+
+        // ── note field (used by several process block responses) ──────────────
+        if let Some(note) = data.get("note") {
+            println!(
+                "    {}Note   : {}{}",
+                dim(),
+                note.as_str().unwrap_or("-"),
+                reset()
+            );
+        }
+
+        // ── Kernel IPs flushed (unblock-pid) ──────────────────────────────────
+        if let Some(flushed) = data.get("kernel_ips_flushed") {
+            println!(
+                "    Kernel IPs flushed : {}",
+                flushed.as_u64().unwrap_or(0)
+            );
         }
     }
 }
@@ -551,11 +754,6 @@ async fn run_command(cmd: serde_json::Value) {
 }
 
 // ── Quit flag ─────────────────────────────────────────────────────────────────
-//
-// A single AtomicBool set by a spawned signal task. Both `monitor` and `logs`
-// check it at the top of each poll loop iteration.  No raw terminal mode is
-// involved, so the terminal is never left in a broken state regardless of how
-// the process exits.
 
 fn make_quit_flag() -> Arc<AtomicBool> {
     let quit = Arc::new(AtomicBool::new(false));
@@ -576,29 +774,8 @@ fn make_quit_flag() -> Arc<AtomicBool> {
     quit
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  LOGS — raw streaming text output
-//
-//  Algorithm per poll:
-//    1. Fetch LiveStats from daemon.
-//    2. Merge rings according to LogStreamConfig.
-//    3. Apply level filter if set.
-//    4. Sort merged slice by time ascending (oldest first within the poll).
-//    5. For each entry compute a dedup key: (time, src_ip, src_port, dst_ip,
-//       dst_port, level).  Skip if already in `seen` set.
-//    6. Print new entries and insert their keys into `seen`.
-//    7. Sleep POLL_INTERVAL_MS then repeat.
-//
-//  The `seen` set grows with the daemon ring buffer size (typically 1000–4000
-//  entries total). Memory stays bounded because the daemon's ring never grows
-//  unboundedly. If you need sessions longer than several hours consider
-//  periodically pruning keys that are older than the daemon's ring window —
-//  but that optimisation is not needed for normal operational use.
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Log streaming ─────────────────────────────────────────────────────────────
 
-/// Compact, allocation-free dedup key for a log entry.
-/// Uses borrowed fields where possible; the HashSet owns String copies only
-/// for the IP strings, which are already heap-allocated in LogEntry.
 #[derive(Hash, PartialEq, Eq)]
 struct EntryKey {
     time:     String,
@@ -623,15 +800,8 @@ impl EntryKey {
     }
 }
 
-/// Format and print a single log entry to stdout.
-///
-/// Output format (color codes omitted when stdout is not a TTY):
-/// ```text
-/// [BLOCK]  14:03:22.441  192.168.1.5:4444  ->  10.0.0.1:80      TCP    curl
-/// ```
 #[inline]
 fn print_entry(e: &LogEntry) {
-    // Format src and dst with port when non-zero.
     let src = if e.src_port != 0 {
         format!("{}:{}", e.src_ip, e.src_port)
     } else {
@@ -647,16 +817,6 @@ fn print_entry(e: &LogEntry) {
     let rst   = reset();
     let dim_c = dim();
 
-    // Fixed-width columns keep the output scannable in a terminal even when
-    // no TUI box is present.  The widths mirror what was used in the old TUI.
-    //
-    //  [LEVEL ]  (8 chars including brackets + padding)
-    //  TIME      (12 chars  HH:MM:SS.mmm)
-    //  SRC       (23 chars  ip:port left-justified)
-    //  ->        (4 chars   literal arrow)
-    //  DST       (23 chars  ip:port left-justified)
-    //  PROTO     (6 chars)
-    //  PROCESS   (remainder, no truncation)
     println!(
         "{color}{label:<8}{rst}  {dim_c}{time}{rst}  {src:<23}  {dim_c}->{rst}  {dst:<23}  \
          {dim_c}{proto:<6}{rst}  {process}",
@@ -672,27 +832,15 @@ fn print_entry(e: &LogEntry) {
     );
 }
 
-/// Extract log entries from a `LiveStats` snapshot according to `cfg`,
-/// returning references into the snapshot sorted by time ascending.
-///
-/// This borrow-based approach avoids cloning entry data on every poll.
 fn collect_entries<'a>(s: &'a LiveStats, cfg: LogStreamConfig) -> Vec<&'a LogEntry> {
-    // Gather references from the appropriate ring(s).
     let mut entries: Vec<&LogEntry> = match cfg.ring {
         Ring::Security => s.recent_logs.iter().collect(),
         Ring::Normal   => s.normal_logs.iter().collect(),
         Ring::Both     => s.recent_logs.iter().chain(s.normal_logs.iter()).collect(),
     };
-
-    // Apply level filter.
     if let Some(level) = cfg.filter {
         entries.retain(|e| e.level == level);
     }
-
-    // Sort by time ascending so we print old→new on each poll.
-    // LogEntry::time is "HH:MM:SS.mmm" — lexicographic ordering is correct
-    // within a single day. Cross-midnight sessions will have at most one
-    // brief reorder artefact, which is acceptable for an operational tool.
     entries.sort_unstable_by(|a, b| a.time.cmp(&b.time));
     entries
 }
@@ -701,8 +849,6 @@ async fn cmd_logs(cmd: LogsCommand) {
     let cfg  = LogStreamConfig::from(cmd);
     let quit = make_quit_flag();
 
-    // Print a one-line header to stderr so it doesn't pollute piped stdout.
-    // This tells the operator what filter is active without being intrusive.
     let filter_label = match cfg.filter {
         None        => "all levels".to_string(),
         Some(level) => level.label().to_string(),
@@ -721,20 +867,13 @@ async fn cmd_logs(cmd: LogsCommand) {
     );
 
     let mut seen: HashSet<EntryKey> = HashSet::new();
-
-    // Flush stdout explicitly after each poll so output appears immediately
-    // even when the process is running inside a pipe.
     let stdout = io::stdout();
 
     loop {
-        if quit.load(Ordering::Relaxed) {
-            break;
-        }
+        if quit.load(Ordering::Relaxed) { break; }
 
         match send_command(&serde_json::json!({"cmd": "logs"}).to_string()).await {
             Err(e) => {
-                // Print connection errors to stderr; don't pollute the log
-                // stream on stdout.  Retry after the poll interval.
                 eprintln!(
                     "{}[rubix] cannot reach daemon: {} — retrying…{}",
                     if use_color() { "\x1B[1;31m" } else { "" },
@@ -759,36 +898,24 @@ async fn cmd_logs(cmd: LogsCommand) {
                         let mut wrote = false;
                         for entry in entries {
                             let key = EntryKey::from_entry(entry);
-                            if seen.contains(&key) {
-                                continue;
-                            }
+                            if seen.contains(&key) { continue; }
                             seen.insert(key);
                             print_entry(entry);
                             wrote = true;
                         }
-                        if wrote {
-                            // Flush after each batch so piped consumers see
-                            // output without buffering delay.
-                            let _ = stdout.lock().flush();
-                        }
+                        if wrote { let _ = stdout.lock().flush(); }
                     }
                 }
             }
         }
 
-        // Sleep in small increments so the quit flag is checked promptly.
-        // We use a 100 ms granularity; total sleep adds up to POLL_INTERVAL_MS.
         let steps = (POLL_INTERVAL_MS / 100).max(1);
         for _ in 0..steps {
-            if quit.load(Ordering::Relaxed) {
-                break;
-            }
+            if quit.load(Ordering::Relaxed) { break; }
             tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         }
     }
 
-    // Print a clean exit line to stderr so it's visible but doesn't mix into
-    // any piped stdout stream the operator may have captured.
     eprintln!(
         "{}[rubix] stream ended{}",
         if use_color() { COLOR_DIM } else { "" },
@@ -796,9 +923,7 @@ async fn cmd_logs(cmd: LogsCommand) {
     );
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MONITOR — in-place TUI, fixed DASHBOARD_LINES frame (unchanged)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Monitor TUI ───────────────────────────────────────────────────────────────
 
 async fn cmd_monitor() {
     print!("\x1B[?25l");
@@ -843,9 +968,7 @@ async fn cmd_monitor() {
     let _ = io::stdout().flush();
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  MONITOR render functions (unchanged from original)
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Monitor render ────────────────────────────────────────────────────────────
 
 fn render_dashboard(s: &LiveStats) {
     let (status_plain, status_color) = if s.block_count > 0 {
@@ -963,24 +1086,17 @@ fn render_monitor_error(msg: &str) {
     dln("");
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Render helpers
-// ─────────────────────────────────────────────────────────────────────────────
+// ── Render helpers ────────────────────────────────────────────────────────────
 
-/// Erase current line then print — used by monitor TUI only.
 #[inline(always)]
 fn dln(s: &str) {
     println!("\x1B[2K\r{}", s);
 }
 
-/// Truncate + pad to exactly `max` visible chars (no ANSI codes in input).
 #[inline]
 fn tpad(s: &str, max: usize) -> String {
-    if s.len() > max {
-        s[..max].to_string()
-    } else {
-        format!("{:<width$}", s, width = max)
-    }
+    if s.len() > max { s[..max].to_string() }
+    else             { format!("{:<width$}", s, width = max) }
 }
 
 fn truncate_tilde(s: &str, max: usize) -> String {
@@ -1000,6 +1116,12 @@ fn fmt_bytes(b: u64) -> String {
     else                       { format!("{}B",    b) }
 }
 
+// ── SHA-256 validation ────────────────────────────────────────────────────────
+
+fn validate_sha256(s: &str) -> bool {
+    s.len() == 64 && s.chars().all(|c| c.is_ascii_hexdigit())
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 #[tokio::main]
@@ -1009,6 +1131,9 @@ async fn main() {
     let cli = Cli::parse();
 
     match cli.command {
+
+        // ── Daemon lifecycle ──────────────────────────────────────────────────
+
         Commands::Start { foreground } => {
             match start_daemon(foreground) {
                 Ok(())  => {}
@@ -1049,6 +1174,8 @@ async fn main() {
             }
         }
 
+        // ── IP blocking ───────────────────────────────────────────────────────
+
         Commands::Block { ip, duration, reason } => {
             require_running();
             if ip.parse::<std::net::IpAddr>().is_err() {
@@ -1077,6 +1204,97 @@ async fn main() {
             run_command(serde_json::json!({"cmd": "list_blocked"})).await;
         }
 
+        // ── Process blocking — PID ────────────────────────────────────────────
+
+        Commands::BlockPid { pid, duration, reason } => {
+            require_running();
+            run_command(serde_json::json!({
+                "cmd":           "block_pid",
+                "pid":           pid,
+                "duration_secs": if duration > 0 { Some(duration) } else { None },
+                "reason":        reason,
+            })).await;
+        }
+
+        Commands::UnblockPid { pid } => {
+            require_running();
+            run_command(serde_json::json!({
+                "cmd": "unblock_pid",
+                "pid": pid,
+            })).await;
+        }
+
+        // ── Process blocking — executable path ────────────────────────────────
+
+        Commands::BlockExe { path, reason } => {
+            require_running();
+            if path.trim().is_empty() {
+                eprintln!("[!] Executable path must not be empty");
+                std::process::exit(1);
+            }
+            run_command(serde_json::json!({
+                "cmd":    "block_executable",
+                "path":   path,
+                "reason": reason,
+            })).await;
+        }
+
+        Commands::UnblockExe { path } => {
+            require_running();
+            run_command(serde_json::json!({
+                "cmd":  "unblock_executable",
+                "path": path,
+            })).await;
+        }
+
+        // ── Process blocking — SHA-256 hash ───────────────────────────────────
+
+        Commands::BlockHash { sha256, reason } => {
+            require_running();
+            let sha256 = sha256.to_lowercase();
+            if !validate_sha256(&sha256) {
+                eprintln!(
+                    "[!] Invalid SHA-256: must be exactly 64 lowercase hex characters.\n    \
+                     Got {} characters.",
+                    sha256.len()
+                );
+                eprintln!(
+                    "    Windows: (Get-FileHash binary.exe -Algorithm SHA256).Hash.ToLower()"
+                );
+                eprintln!(
+                    "    Linux:   sha256sum /path/to/binary"
+                );
+                std::process::exit(1);
+            }
+            run_command(serde_json::json!({
+                "cmd":    "block_hash",
+                "sha256": sha256,
+                "reason": reason,
+            })).await;
+        }
+
+        Commands::UnblockHash { sha256 } => {
+            require_running();
+            let sha256 = sha256.to_lowercase();
+            if !validate_sha256(&sha256) {
+                eprintln!("[!] Invalid SHA-256: must be exactly 64 lowercase hex characters");
+                std::process::exit(1);
+            }
+            run_command(serde_json::json!({
+                "cmd":    "unblock_hash",
+                "sha256": sha256,
+            })).await;
+        }
+
+        // ── List all process blocks ───────────────────────────────────────────
+
+        Commands::ListProcesses => {
+            require_running();
+            run_command(serde_json::json!({"cmd": "list_blocked_processes"})).await;
+        }
+
+        // ── Policy ────────────────────────────────────────────────────────────
+
         Commands::Rules => {
             require_running();
             run_command(serde_json::json!({"cmd": "get_rules"})).await;
@@ -1087,13 +1305,13 @@ async fn main() {
             run_command(serde_json::json!({"cmd": "reload_config"})).await;
         }
 
+        // ── Monitoring ────────────────────────────────────────────────────────
+
         Commands::Monitor => {
             require_running();
             cmd_monitor().await;
         }
 
-        // `rubix-cli logs` with no subcommand → stream all rings, all levels.
-        // clap routes an absent subcommand here via the hidden `All` variant.
         Commands::Logs(sub) => {
             require_running();
             cmd_logs(sub).await;

@@ -1,120 +1,75 @@
 // src/control/commands.rs
-//! Control commands and responses for RUBIX IPC.
-//!
-//! Transport: JSON over Unix socket (Linux) / TCP loopback (Windows).
-//! All commands are tagged with `"cmd"` so the wire format is stable and
-//! forwards-compatible.
-
 use crate::types::stats::LiveStats;
 use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
-
-// ── Commands (CLI → daemon) ───────────────────────────────────────────────────
+use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "cmd", rename_all = "snake_case")]
 pub enum Command {
-    /// Lightweight status check: uptime, block count, rule count.
     Status,
-
-    /// Full live-stats snapshot: pps, top procs, recent threats, heartbeat.
-    /// Powers the `rubix-cli monitor` TUI dashboard.
     Stats,
-
-    /// Block an IP address, optionally for a limited duration.
-    BlockIp {
-        ip:            IpAddr,
-        /// None or 0 → permanent.
-        duration_secs: Option<u64>,
-        reason:        Option<String>,
-    },
-
-    /// Remove a block rule.
-    UnblockIp {
-        ip: IpAddr,
-    },
-
-    /// List all currently active block rules.
+    Logs,
+    BlockIp   { ip: IpAddr, duration_secs: Option<u64>, reason: Option<String> },
+    UnblockIp { ip: IpAddr },
     ListBlocked,
 
-    /// Hot-reload rules.yaml without restarting.
+    /// Block a specific running PID.
+    /// {"cmd":"block_pid","pid":1234,"duration_secs":300,"reason":"suspicious"}
+    BlockPid {
+        pid:          u32,
+        duration_secs: Option<u64>,
+        reason:       Option<String>,
+    },
+
+    /// Block all processes running from an executable path.
+    /// {"cmd":"block_executable","path":"/usr/bin/curl","reason":"banned"}
+    BlockExecutable {
+        path:   PathBuf,
+        reason: Option<String>,
+    },
+
+    /// Block any process whose executable SHA-256 matches.
+    /// {"cmd":"block_hash","sha256":"aabbcc...","reason":"malware"}
+    BlockHash {
+        /// Lowercase hex-encoded SHA-256 (64 chars).
+        sha256: String,
+        reason: Option<String>,
+    },
+
+    UnblockPid        { pid:    u32     },
+    UnblockExecutable { path:   PathBuf },
+    UnblockHash       { sha256: String  },
+
+    ListBlockedProcesses,
+
     ReloadConfig,
-
-    /// Ask the daemon to perform a graceful shutdown.
     Shutdown,
-
-    /// List all loaded policy rules.
     GetRules,
-
-    /// Return the structured live log ring buffer from `LiveStats`.
-    ///
-    /// The daemon responds with a `CommandResponse` whose `live_stats`
-    /// field contains the full snapshot — the CLI extracts `recent_logs`
-    /// and applies its own client-side filter.
-    ///
-    /// Re-uses the existing `stats` snapshot path so no new IPC or locking
-    /// primitives are needed.
-    Logs,
 }
-
-// ── Responses (daemon → CLI) ──────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CommandResponse {
     pub success:   bool,
     pub message:   String,
-
-    /// Present for Status, ListBlocked, GetRules, Stats.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data:      Option<serde_json::Value>,
-
-    /// Full live-stats snapshot — set for both `Stats` and `Logs` commands.
-    /// Kept as a dedicated field (not folded into `data`) so the CLI can
-    /// deserialise it without extra JSON pointer lookups.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub live_stats: Option<LiveStats>,
-
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
 impl CommandResponse {
     pub fn success(message: impl Into<String>) -> Self {
-        Self {
-            success:    true,
-            message:    message.into(),
-            data:       None,
-            live_stats: None,
-            timestamp:  chrono::Utc::now(),
-        }
+        Self { success: true,  message: message.into(), data: None, live_stats: None, timestamp: chrono::Utc::now() }
     }
-
     pub fn success_with_data(message: impl Into<String>, data: serde_json::Value) -> Self {
-        Self {
-            success:    true,
-            message:    message.into(),
-            data:       Some(data),
-            live_stats: None,
-            timestamp:  chrono::Utc::now(),
-        }
+        Self { success: true,  message: message.into(), data: Some(data), live_stats: None, timestamp: chrono::Utc::now() }
     }
-
     pub fn success_with_stats(message: impl Into<String>, stats: LiveStats) -> Self {
-        Self {
-            success:    true,
-            message:    message.into(),
-            data:       None,
-            live_stats: Some(stats),
-            timestamp:  chrono::Utc::now(),
-        }
+        Self { success: true,  message: message.into(), data: None, live_stats: Some(stats), timestamp: chrono::Utc::now() }
     }
-
     pub fn error(message: impl Into<String>) -> Self {
-        Self {
-            success:    false,
-            message:    message.into(),
-            data:       None,
-            live_stats: None,
-            timestamp:  chrono::Utc::now(),
-        }
+        Self { success: false, message: message.into(), data: None, live_stats: None, timestamp: chrono::Utc::now() }
     }
 }

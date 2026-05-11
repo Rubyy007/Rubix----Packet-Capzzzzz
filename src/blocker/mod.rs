@@ -1,59 +1,77 @@
 // src/blocker/mod.rs
-//! Blocker module — kernel-level IP enforcement
+//! Blocker module — kernel-level IP enforcement + process blocklist.
 
 #![allow(dead_code)]
 
-mod cache;
-mod cleaner;
+pub mod cache;
+pub mod cleaner;
+pub mod process;
 
 #[cfg(target_os = "linux")]
-mod linux;
+pub mod linux;
 
 #[cfg(target_os = "windows")]
-mod windows;
+pub mod windows;
 
-// ── Public re-exports ─────────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
 pub use linux::LinuxBlocker;
-
 #[cfg(target_os = "windows")]
 pub use windows::WindowsBlocker;
 
-// ── Platform type alias ───────────────────────────────────────────────────────
 #[cfg(target_os = "linux")]
 pub type PlatformBlocker = linux::LinuxBlocker;
-
 #[cfg(target_os = "windows")]
 pub type PlatformBlocker = windows::WindowsBlocker;
 
-// ── Shared types ──────────────────────────────────────────────────────────────
+pub use process::ProcessBlocklist;
+
 use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
 use std::net::IpAddr;
+use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 use thiserror::Error;
 
-#[derive(Debug, Clone)]
+// ── IP block rule ─────────────────────────────────────────────────────────────
+
+/// Optional origin tag — set when a kernel IP rule was installed
+/// as a consequence of a process block.  Enables per-process cleanup.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum BlockOrigin {
+    /// Installed manually via CLI `block-ip`.
+    Manual,
+    /// Installed automatically because of a process block.
+    ProcessBlock {
+        pid:  u32,
+        name: String,
+        exe:  Option<PathBuf>,
+    },
+}
+
+impl Default for BlockOrigin {
+    fn default() -> Self { BlockOrigin::Manual }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BlockRule {
-    pub id: String,
-    pub target: IpAddr,
+    pub id:         String,
+    pub target:     IpAddr,
     pub created_at: SystemTime,
     pub expires_at: Option<SystemTime>,
-    pub reason: String,
+    pub reason:     String,
+    #[serde(default)]
+    pub origin:     BlockOrigin,
 }
 
 impl BlockRule {
-    /// Returns true if this is a permanent block (no expiry)
-    pub fn is_permanent(&self) -> bool {
-        self.expires_at.is_none()
-    }
+    #[inline]
+    pub fn is_permanent(&self) -> bool { self.expires_at.is_none() }
 
-    /// Returns remaining duration for timed blocks, None if permanent or expired
     pub fn remaining(&self) -> Option<Duration> {
         let expires = self.expires_at?;
         expires.duration_since(SystemTime::now()).ok()
     }
 
-    /// Returns a human-readable description of the block duration
     pub fn duration_display(&self) -> String {
         match self.remaining() {
             None if self.is_permanent() => "permanent".to_string(),
@@ -72,8 +90,13 @@ impl BlockRule {
     }
 }
 
+// ── Errors ────────────────────────────────────────────────────────────────────
+
 #[derive(Error, Debug)]
 pub enum BlockerError {
+    #[error("nftables error: {0}")]
+    NftablesError(String),
+
     #[error("iptables error: {0}")]
     IptablesError(String),
 
@@ -88,18 +111,29 @@ pub enum BlockerError {
 
     #[error("Failed to execute command: {0}")]
     CommandFailed(String),
+
+    #[error("Process error: {0}")]
+    ProcessError(String),
 }
 
-// ── Trait ─────────────────────────────────────────────────────────────────────
+// ── Blocker trait ─────────────────────────────────────────────────────────────
+
 #[async_trait]
 pub trait Blocker: Send + Sync {
-    /// Block an IP permanently until manually unblocked.
+    /// Block an IP permanently.
     async fn block_ip(&self, ip: IpAddr) -> Result<String, BlockerError>;
 
-    /// Block an IP for a specific duration, then auto-unblock.
+    /// Block an IP permanently with an origin tag.
+    async fn block_ip_with_origin(
+        &self,
+        ip:     IpAddr,
+        origin: BlockOrigin,
+    ) -> Result<String, BlockerError>;
+
+    /// Block an IP for a specific duration.
     async fn block_ip_timed(
         &self,
-        ip: IpAddr,
+        ip:       IpAddr,
         duration: Duration,
     ) -> Result<String, BlockerError>;
 
