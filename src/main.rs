@@ -56,21 +56,20 @@ const OS_NAME: &str = "windows";
 
 // ── Packet-loop constants ─────────────────────────────────────────────────────
 
-const MAX_PROC_ENTRIES:      usize    = 512;
-const MAX_UNIQUE_DSTS:       usize    = 256;
-const MAX_UNIQUE_SRCS:       usize    = 256;
-const MAX_UNIQUE_PROTOCOLS:  usize    = 16;
-const PROC_TTL_SECS:         u64      = 300;
-const PROC_TTL_DURATION:     Duration = Duration::from_secs(PROC_TTL_SECS);
-const IDLE_SLEEP_MS:         u64      = 10;
-const TIMEOUT_WARN_THRESHOLD: u32     = 3000;
+const MAX_PROC_ENTRIES:       usize    = 512;
+const MAX_UNIQUE_DSTS:        usize    = 256;
+const MAX_UNIQUE_SRCS:        usize    = 256;
+const MAX_UNIQUE_PROTOCOLS:   usize    = 16;
+const PROC_TTL_SECS:          u64      = 300;
+const PROC_TTL_DURATION:      Duration = Duration::from_secs(PROC_TTL_SECS);
+const IDLE_SLEEP_MS:          u64      = 10;
+const TIMEOUT_WARN_THRESHOLD: u32      = 3000;
 
 // ── Per-process statistics (packet-loop-private) ──────────────────────────────
 
 #[derive(Clone)]
 struct ProcStats {
     name:    String,
-    // Window-scoped (reset every 5s)
     packets: u64,
     bytes:   u64,
     blocked: u64,
@@ -78,7 +77,6 @@ struct ProcStats {
     unique_dsts: FxHashSet<IpAddr>,
     unique_srcs: FxHashSet<IpAddr>,
     protocols:   FxHashSet<String>,
-    // Lifetime totals (never reset)
     total_packets:          u64,
     total_blocked:          u64,
     total_alerted:          u64,
@@ -103,8 +101,6 @@ impl ProcStats {
         }
     }
 
-    /// Reset window-scoped counters and sets. Lifetime scalars and
-    /// last_active are intentionally preserved.
     #[inline]
     fn reset_window(&mut self) {
         self.packets = 0;
@@ -117,7 +113,7 @@ impl ProcStats {
     }
 }
 
-// ── proc_stats insertion — get_mut() fast path, entry() cold path ─────────────
+// ── proc_stats insertion ──────────────────────────────────────────────────────
 
 #[inline]
 fn proc_stats_insert_or_get<'a>(
@@ -166,7 +162,6 @@ impl Heartbeat {
         let padding = self.capacity.saturating_sub(self.samples.len());
         let pad_str = "_".repeat(padding);
         if self.samples.is_empty() { return pad_str; }
-
         let max  = self.samples.iter().cloned().fold(1.0_f64, f64::max);
         let bars = ['_', '.', '-', '^', '|'];
         let wave: String = self.samples.iter().map(|&v| {
@@ -231,7 +226,9 @@ fn extract_malicious_ips_from_rules(configs_dir: &std::path::Path) -> Vec<String
         if !rule.get("enabled").and_then(|e| e.as_bool()).unwrap_or(true) { continue; }
         if rule.get("action").and_then(|a| a.as_str()) != Some("Block") { continue; }
         if let Some(dst_ips) = rule
-            .get("conditions").and_then(|c| c.get("dst_ips")).and_then(|i| i.as_sequence())
+            .get("conditions")
+            .and_then(|c| c.get("dst_ips"))
+            .and_then(|i| i.as_sequence())
         {
             for ip in dst_ips {
                 if let Some(s) = ip.as_str() {
@@ -403,7 +400,6 @@ fn is_ingress_packet(src_ip: IpAddr, dst_ip: IpAddr) -> bool {
     dst_ip.is_loopback() || (is_private_ip(dst_ip) && !is_private_ip(src_ip))
 }
 
-/// Returns true for RFC-1918 (IPv4) and RFC-4291/4193 (IPv6) private ranges.
 #[inline(always)]
 fn is_private_ip(ip: IpAddr) -> bool {
     match ip {
@@ -416,8 +412,8 @@ fn is_private_ip(ip: IpAddr) -> bool {
         IpAddr::V6(v6) => {
             if v6.is_loopback() { return true; }
             let o = v6.octets();
-            let is_link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80; // fe80::/10
-            let is_ula        = (o[0] & 0xfe) == 0xfc;                   // fc00::/7
+            let is_link_local = o[0] == 0xfe && (o[1] & 0xc0) == 0x80;
+            let is_ula        = (o[0] & 0xfe) == 0xfc;
             is_link_local || is_ula
         }
     }
@@ -577,6 +573,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let proc_blocklist = ProcessBlocklist::new();
     let malicious_ips  = extract_malicious_ips_from_rules(&configs_dir);
 
+    // ── Startup sweep — remove orphaned filters from previous force-killed runs.
+    //
+    // Uses deterministic WFP keys — no enumeration, no Defender conflict.
+    // FWP_E_FILTER_NOT_FOUND is silently ignored so this is always safe.
+    // This guarantees a clean slate before installing fresh policy blocks.
+    info!("Sweeping orphaned kernel filters from previous session...");
+    let mut swept = 0usize;
+    for ip_str in &malicious_ips {
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            match blocker.force_unblock_ip(ip).await {
+                Ok(())  => { swept += 1; }
+                Err(e)  => warn!(ip = %ip_str, error = %e, "Orphan sweep failed (non-fatal)"),
+            }
+        }
+    }
+    if swept > 0 {
+        info!(count = swept, "Orphaned filter sweep complete");
+    }
+
+    // ── Install fresh policy blocks from rules.yaml ───────────────────────────
     let mut kernel_rules = 0usize;
     for ip_str in &malicious_ips {
         if let Ok(ip) = ip_str.parse::<IpAddr>() {
@@ -669,14 +685,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //  PACKET LOOP
     // ─────────────────────────────────────────────────────────────────────────
 
-    let mut packet_count:         u64  = 0;
-    let mut block_count:          u64  = 0;
-    let mut alert_count:          u64  = 0;
-    let mut last_stats_time             = start_time;
-    let mut last_packet_count:    u64  = 0;
-    let mut last_window_reset           = start_time;
-    let mut normal_sample_counter: u64 = 0;
-    let mut consecutive_timeouts:  u32 = 0;
+    let mut packet_count:          u64  = 0;
+    let mut block_count:           u64  = 0;
+    let mut alert_count:           u64  = 0;
+    let mut last_stats_time              = start_time;
+    let mut last_packet_count:     u64  = 0;
+    let mut last_window_reset            = start_time;
+    let mut normal_sample_counter: u64  = 0;
+    let mut consecutive_timeouts:  u32  = 0;
     let mut timeout_warned:        bool = false;
 
     let mut heartbeat   = Heartbeat::new(30);
@@ -691,7 +707,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         match timeout(Duration::from_millis(100), capture.next_packet()).await {
 
-            // ── Packet received ───────────────────────────────────────────────
             Ok(Some(packet)) => {
                 consecutive_timeouts = 0;
                 timeout_warned       = false;
@@ -699,7 +714,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 let proto = Protocol::from_str(&packet.protocol.to_string());
 
-                // Resolve owning process via flow table.
                 let proc_info = resolver.lookup(&FlowKey {
                     local_ip:   packet.src_ip,
                     local_port: packet.src_port,
@@ -710,7 +724,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     protocol:   proto,
                 }));
 
-                // Update per-process stats.
                 let now_instant = Instant::now();
                 if let Some(ref info) = proc_info {
                     if let Some(entry) = proc_stats_insert_or_get(
@@ -724,12 +737,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                         if entry.unique_dsts.len() < MAX_UNIQUE_DSTS {
                             if entry.unique_dsts.insert(packet.dst_ip) {
-                                entry.total_unique_dsts = entry.total_unique_dsts.saturating_add(1);
+                                entry.total_unique_dsts =
+                                    entry.total_unique_dsts.saturating_add(1);
                             }
                         }
                         if entry.unique_srcs.len() < MAX_UNIQUE_SRCS {
                             if entry.unique_srcs.insert(packet.src_ip) {
-                                entry.total_unique_srcs = entry.total_unique_srcs.saturating_add(1);
+                                entry.total_unique_srcs =
+                                    entry.total_unique_srcs.saturating_add(1);
                             }
                         }
                         if entry.protocols.len() < MAX_UNIQUE_PROTOCOLS {
@@ -744,7 +759,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let proc_name  = proc_info.as_ref().map(|p| p.name.as_str());
                 let is_ingress = is_ingress_packet(packet.src_ip, packet.dst_ip);
 
-                // ── Threat detection ──────────────────────────────────────────
                 let threat: Option<ThreatEvent> = match packet.protocol {
                     crate::types::Protocol::Tcp => ScanDetector::analyze_tcp(
                         &mut threat_tracker, packet.src_ip, packet.dst_port,
@@ -794,11 +808,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     threat_tracker.maybe_evict();
                 }
 
-                // ── Process blocklist check (PID / exe / hash) ────────────────
-                //
-                // Fast path: DashMap pid_blocks lookup — O(1), no allocation.
-                // Cold path: exe path resolved once per PID, cached 30s.
-                // On match: remote IP is kernel-blocked and tagged with origin.
                 let proc_block_reason = proc_info.as_ref().and_then(|info| {
                     proc_blocklist.check(info.pid, &info.name)
                 });
@@ -806,12 +815,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(ref reason) = proc_block_reason {
                     block_count = block_count.saturating_add(1);
 
-                    // Determine which IP to kernel-block (remote end).
                     let remote_ip = if is_ingress { packet.src_ip } else { packet.dst_ip };
 
-                    // Install kernel rule tagged with process origin so
-                    // list_rules() shows which process caused each block,
-                    // and unblock_pid() can flush all associated IPs.
                     if let Some(ref info) = proc_info {
                         let origin = BlockOrigin::ProcessBlock {
                             pid:  info.pid,
@@ -847,9 +852,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &format!("process-blocked: {:?}", reason),
                     );
 
-                    // Skip policy evaluation — process is definitively blocked.
                 } else {
-                    // ── Policy engine evaluation ──────────────────────────────
                     match policy_engine.evaluate(&packet, proc_name) {
                         RuleAction::Block => {
                             block_count = block_count.saturating_add(1);
@@ -942,7 +945,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     }
                 }
 
-                // ── Stats update (every 50 or 500 packets) ────────────────────
                 let check_interval = if packet_count < 1_000 { 50 } else { 500 };
                 if packet_count % check_interval == 0 {
                     let now = Instant::now();
@@ -979,7 +981,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             }
 
-            // ── Capture heartbeat (no packet) ─────────────────────────────────
             Ok(None) => {
                 consecutive_timeouts = 0;
                 timeout_warned       = false;
@@ -991,7 +992,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &shared_stats,
                         packet_count, block_count, alert_count,
                         0.0,
-                        packet_count as f64 / start_time.elapsed().as_secs_f64().max(0.001),
+                        packet_count as f64 /
+                            start_time.elapsed().as_secs_f64().max(0.001),
                         start_time.elapsed().as_secs_f64(),
                         heartbeat.render(),
                         &proc_stats, &recent_threats,
@@ -1003,7 +1005,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 sleep(Duration::from_millis(IDLE_SLEEP_MS)).await;
             }
 
-            // ── Capture timeout — one-shot warning after ~5 min silence ───────
             Err(_) => {
                 consecutive_timeouts = consecutive_timeouts.saturating_add(1);
                 if consecutive_timeouts >= TIMEOUT_WARN_THRESHOLD && !timeout_warned {
@@ -1025,9 +1026,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("║                     SHUTTING DOWN RUBIX                          ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
 
+    // Remove all WFP filters — both tracked rules and any remaining orphans
+    // from rules.yaml that may not have been explicitly unblocked.
     info!("Cleaning up kernel rules...");
     if let Err(e) = blocker.cleanup().await {
         error!(error = %e, "Kernel cleanup failed — manual flush may be needed");
+    }
+
+    // Force-sweep rules.yaml IPs in case any slipped through cleanup
+    // (e.g. process-block-originated rules that cleanup() missed).
+    for ip_str in &malicious_ips {
+        if let Ok(ip) = ip_str.parse::<IpAddr>() {
+            let _ = blocker.force_unblock_ip(ip).await;
+        }
     }
 
     if timeout(Duration::from_secs(2), capture.stop()).await.is_err() {

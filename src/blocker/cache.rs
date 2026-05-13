@@ -1,72 +1,70 @@
 // src/blocker/cache.rs
-//! In-memory cache for blocked IPs — avoids repeated kernel calls
+//! In-memory cache for blocked IPs — avoids repeated kernel calls.
+//! Uses parking_lot::RwLock for poison-free operation consistent with
+//! the rest of the codebase.
 
 #![allow(dead_code)]
 
-use std::collections::HashSet;
+use parking_lot::RwLock;
+use rustc_hash::FxHashSet;
 use std::net::IpAddr;
-use std::sync::RwLock;
 use tracing::debug;
 
 pub struct BlockCache {
-    blocked_ips: RwLock<HashSet<IpAddr>>,
-    max_size: usize,
+    blocked_ips: RwLock<FxHashSet<IpAddr>>,
+    max_size:    usize,
 }
 
 impl BlockCache {
     pub fn new(max_size: usize) -> Self {
         Self {
-            blocked_ips: RwLock::new(HashSet::with_capacity(max_size)),
+            blocked_ips: RwLock::new(FxHashSet::with_capacity_and_hasher(
+                max_size.min(4096),
+                Default::default(),
+            )),
             max_size,
         }
     }
 
+    #[inline]
     pub fn contains(&self, ip: &IpAddr) -> bool {
-        self.blocked_ips.read()
-            .map(|g| g.contains(ip))
-            .unwrap_or(false)
+        self.blocked_ips.read().contains(ip)
     }
 
     pub fn insert(&self, ip: IpAddr) -> bool {
-        match self.blocked_ips.write() {
-            Ok(mut guard) => {
-                if guard.len() >= self.max_size {
-                    let to_remove: Vec<IpAddr> = guard
-                        .iter()
-                        .take(self.max_size / 2)
-                        .cloned()
-                        .collect();
-                    for ip in to_remove {
-                        guard.remove(&ip);
-                    }
-                    debug!("Block cache evicted {} entries", self.max_size / 2);
-                }
-                guard.insert(ip)
+        let mut guard = self.blocked_ips.write();
+        if guard.len() >= self.max_size {
+            // Evict half — deterministic order via collect+drain.
+            let to_remove: Vec<IpAddr> = guard
+                .iter()
+                .take(self.max_size / 2)
+                .cloned()
+                .collect();
+            for evict in &to_remove {
+                guard.remove(evict);
             }
-            Err(_) => false,
+            debug!(evicted = to_remove.len(), "Block cache evicted entries");
         }
+        guard.insert(ip)
     }
 
+    #[inline]
     pub fn remove(&self, ip: &IpAddr) -> bool {
-        self.blocked_ips.write()
-            .map(|mut g| g.remove(ip))
-            .unwrap_or(false)
+        self.blocked_ips.write().remove(ip)
     }
 
     pub fn clear(&self) {
-        if let Ok(mut g) = self.blocked_ips.write() {
-            g.clear();
-        }
+        self.blocked_ips.write().clear();
         debug!("Block cache cleared");
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
-        self.blocked_ips.read()
-            .map(|g| g.len())
-            .unwrap_or(0)
+        self.blocked_ips.read().len()
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.blocked_ips.read().is_empty()
     }
 }

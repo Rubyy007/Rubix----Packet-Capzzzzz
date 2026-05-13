@@ -234,6 +234,18 @@ impl Blocker for LinuxBlocker {
         Ok(true)
     }
 
+    /// Force-remove an IP from nftables regardless of whether this session
+    /// installed it.  On Linux, nft_remove_ip already handles "not found"
+    /// gracefully so this is safe to call unconditionally.
+    async fn force_unblock_ip(&self, ip: IpAddr) -> Result<(), BlockerError> {
+        let _g = self.nft_lock.lock();
+        self.rules.write().remove(&ip);
+        self.ip_cache.remove(&ip);
+        self.nft_remove_ip(&ip)?;
+        info!(ip = %ip, "nftables force-unblock complete");
+        Ok(())
+    }
+
     async fn is_blocked(&self, ip: &IpAddr) -> Result<bool, BlockerError> {
         if self.ip_cache.contains(ip) { return Ok(true); }
         Ok(self.rules.read().contains_key(ip))

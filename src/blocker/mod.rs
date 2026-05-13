@@ -34,13 +34,9 @@ use thiserror::Error;
 
 // ── IP block rule ─────────────────────────────────────────────────────────────
 
-/// Optional origin tag — set when a kernel IP rule was installed
-/// as a consequence of a process block.  Enables per-process cleanup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum BlockOrigin {
-    /// Installed manually via CLI `block-ip`.
     Manual,
-    /// Installed automatically because of a process block.
     ProcessBlock {
         pid:  u32,
         name: String,
@@ -137,7 +133,15 @@ pub trait Blocker: Send + Sync {
         duration: Duration,
     ) -> Result<String, BlockerError>;
 
+    /// Remove IP from rule map and delete WFP filters if tracked.
     async fn unblock_ip(&self, ip: IpAddr) -> Result<bool, BlockerError>;
+
+    /// Force-remove WFP filters for an IP using deterministic keys,
+    /// regardless of whether this session installed them.
+    /// Use when unblock_ip returns false (IP not in rule map) but
+    /// the IP may still have orphaned filters from a previous run.
+    async fn force_unblock_ip(&self, ip: IpAddr) -> Result<(), BlockerError>;
+
     async fn is_blocked(&self, ip: &IpAddr) -> Result<bool, BlockerError>;
     async fn list_rules(&self) -> Result<Vec<BlockRule>, BlockerError>;
     async fn cleanup(&self) -> Result<(), BlockerError>;
