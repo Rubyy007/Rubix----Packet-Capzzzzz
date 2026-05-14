@@ -1,49 +1,81 @@
 // src/capture/windows.rs
-//! Windows production packet capture using NPcap (libpcap-compatible API)
+//! Windows production packet capture using NPcap (libpcap-compatible API).
 //!
-//! Uses etherparse 0.15+ API:
-//!   - parsed.net              (was parsed.ip)
-//!   - NetHeaders::Ipv4        (was IpHeader::Version4)
-//!   - NetHeaders::Ipv6        (was IpHeader::Version6)
+//! Architecture:
+//!   A dedicated OS thread owns the `Capture<Active>` handle for its entire
+//!   lifetime.  It loops, reads one packet at a time (blocking inside the
+//!   thread — never on the async executor), and sends raw bytes down a
+//!   bounded `std::sync::mpsc::SyncSender`.  The async side calls
+//!   `next_packet()` which does a cheap non-blocking `try_recv()` under a
+//!   `std::sync::Mutex` — the mutex satisfies the `Sync` bound required by
+//!   `CaptureBackend` without introducing any blocking in the fast path.
+//!
+//! etherparse requirement: 0.15+
+//!   parsed.net / NetHeaders::Ipv4 / NetHeaders::Ipv6
+//!
+//! Bug fixes applied:
+//!   #1  Capture<Active> is not Send     — dedicated thread owns the handle.
+//!   #3  i32 overflow on buffer_size     — saturating_mul + try_from.
+//!   #4  spawn_blocking per packet       — single long-lived capture thread.
+//!   #6  No real kernel drop stats       — cap.stats() polled every second.
+//!   #7  English-locale status string    — numeric IfOperStatus comparison.
+//!  #11  Receiver<T> is not Sync         — wrapped in std::sync::Mutex.
 
 use super::{CaptureBackend, CaptureConfig, CaptureError, CaptureStats};
 use crate::types::{Packet, Protocol};
 use async_trait::async_trait;
 use pcap::{Active, Capture, Device};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use tokio::sync::Mutex;
-use tokio::task::spawn_blocking;
-use tracing::{debug, info};
+use std::sync::mpsc::{self, SyncSender, TryRecvError};
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
+use tracing::{debug, info, warn};
 
-// ── Capture handle ────────────────────────────────────────────────────────────
+// ── Channel capacity ──────────────────────────────────────────────────────────
+const CHANNEL_CAPACITY: usize = 4096;
+
+// ── Public handle ─────────────────────────────────────────────────────────────
 
 pub struct WindowsCapture {
-    config:  CaptureConfig,
-    capture: Arc<Mutex<Option<Capture<Active>>>>,
-    stats:   Arc<CaptureStatsInternal>,
-    running: Arc<AtomicBool>,
+    config:   CaptureConfig,
+    /// Receives raw packet bytes from the capture thread.
+    ///
+    /// `std::sync::mpsc::Receiver<T>` is `Send` but not `Sync`.
+    /// `CaptureBackend` requires `Send + Sync`.
+    /// Wrapping in `Mutex` makes the field `Sync` (Mutex<T>: Sync when T: Send).
+    /// The lock is held only for a single non-blocking `try_recv()` call —
+    /// nanoseconds — so this does not affect fast-path latency.
+    ///
+    /// `None` before `start()` is called.
+    receiver: Mutex<Option<mpsc::Receiver<Vec<u8>>>>,
+    stats:    Arc<CaptureStatsInternal>,
+    running:  Arc<AtomicBool>,
 }
 
-// ── Internal stats (all atomic — hot path safe) ───────────────────────────────
+// ── Internal stats (all atomic — hot-path safe) ───────────────────────────────
 
 struct CaptureStatsInternal {
-    packets_received:        AtomicU64,
-    packets_dropped:         AtomicU64,
-    packets_filtered:        AtomicU64,
-    bytes_received:          AtomicU64,
-    current_second_packets:  AtomicU64,
+    packets_received:       AtomicU64,
+    /// Kernel-reported drops (ring-buffer overruns inside NPcap).
+    packets_dropped_kernel: AtomicU64,
+    /// Application-level errors (unexpected read errors).
+    packets_dropped_app:    AtomicU64,
+    packets_filtered:       AtomicU64,
+    bytes_received:         AtomicU64,
+    current_second_packets: AtomicU64,
 }
 
 impl CaptureStatsInternal {
     fn new() -> Self {
         Self {
-            packets_received:        AtomicU64::new(0),
-            packets_dropped:         AtomicU64::new(0),
-            packets_filtered:        AtomicU64::new(0),
-            bytes_received:          AtomicU64::new(0),
-            current_second_packets:  AtomicU64::new(0),
+            packets_received:       AtomicU64::new(0),
+            packets_dropped_kernel: AtomicU64::new(0),
+            packets_dropped_app:    AtomicU64::new(0),
+            packets_filtered:       AtomicU64::new(0),
+            bytes_received:         AtomicU64::new(0),
+            current_second_packets: AtomicU64::new(0),
         }
     }
 }
@@ -57,16 +89,14 @@ impl WindowsCapture {
 
         Ok(Self {
             config,
-            capture: Arc::new(Mutex::new(None)),
-            stats:   Arc::new(CaptureStatsInternal::new()),
-            running: Arc::new(AtomicBool::new(false)),
+            receiver: Mutex::new(None),
+            stats:    Arc::new(CaptureStatsInternal::new()),
+            running:  Arc::new(AtomicBool::new(false)),
         })
     }
 
     // ── Interface resolution ──────────────────────────────────────────────────
 
-    /// Resolve interface name → pcap Device.
-    /// Accepts full NPcap device names (\Device\NPF_{GUID}) or "auto".
     fn resolve_interface(interface: &str) -> Result<Device, CaptureError> {
         let devices = Device::list()
             .map_err(|e| CaptureError::PcapError(e.to_string()))?;
@@ -89,22 +119,25 @@ impl WindowsCapture {
             devices
                 .into_iter()
                 .find(|d| d.name == interface)
-                .ok_or_else(|| {
-                    CaptureError::InterfaceNotFound(interface.to_string())
-                })
+                .ok_or_else(|| CaptureError::InterfaceNotFound(interface.to_string()))
         }
     }
 
     // ── Capture handle setup ──────────────────────────────────────────────────
 
-    /// Open and configure the pcap handle using settings from config.
-    fn open_capture(&self, device: Device) -> Result<Capture<Active>, CaptureError> {
+    /// Bug #3 fix: buffer_size_mb is usize; convert safely to i32.
+    fn open_capture(config: &CaptureConfig, device: Device) -> Result<Capture<Active>, CaptureError> {
+        let buf_bytes = config
+            .buffer_size_mb
+            .saturating_mul(1024 * 1024);
+        let buf_i32 = i32::try_from(buf_bytes).unwrap_or(i32::MAX);
+
         let mut cap = Capture::from_device(device)
             .map_err(|e| CaptureError::PcapError(e.to_string()))?
-            .timeout(self.config.timeout_ms)
-            .promisc(self.config.promiscuous)
-            .snaplen(self.config.snaplen)
-            .buffer_size((self.config.buffer_size_mb * 1024 * 1024) as i32)
+            .timeout(config.timeout_ms)
+            .promisc(config.promiscuous)
+            .snaplen(config.snaplen)
+            .buffer_size(buf_i32)
             .open()
             .map_err(|e| {
                 let msg = e.to_string();
@@ -117,7 +150,7 @@ impl WindowsCapture {
                 }
             })?;
 
-        if let Some(filter) = &self.config.bpf_filter {
+        if let Some(filter) = &config.bpf_filter {
             cap.filter(filter, true)
                 .map_err(|e| CaptureError::InvalidFilter(e.to_string()))?;
             debug!("Applied BPF filter: {}", filter);
@@ -126,21 +159,78 @@ impl WindowsCapture {
         Ok(cap)
     }
 
+    // ── Capture thread ────────────────────────────────────────────────────────
+
+    /// Bug #1 + #4 fix: `Capture<Active>` is owned exclusively by this thread.
+    /// Bug #6 fix: cap.stats() polled every second for real kernel drop counts.
+    fn spawn_capture_thread(
+        cap:     Capture<Active>,
+        tx:      SyncSender<Vec<u8>>,
+        stats:   Arc<CaptureStatsInternal>,
+        running: Arc<AtomicBool>,
+    ) {
+        thread::Builder::new()
+            .name("rubix-capture".to_string())
+            .spawn(move || {
+                let mut cap = cap;
+
+                let mut last_stats_poll = std::time::Instant::now();
+                let stats_interval      = Duration::from_secs(1);
+
+                info!("Capture thread started");
+
+                while running.load(Ordering::Relaxed) {
+                    // ── Kernel stats poll (Bug #6 fix) ────────────────────────
+                    if last_stats_poll.elapsed() >= stats_interval {
+                        if let Ok(s) = cap.stats() {
+                            stats
+                                .packets_dropped_kernel
+                                .store(s.dropped as u64, Ordering::Relaxed);
+                        }
+                        stats.current_second_packets.store(0, Ordering::Relaxed);
+                        last_stats_poll = std::time::Instant::now();
+                    }
+
+                    match cap.next_packet() {
+                        Ok(packet) => {
+                            let len = packet.data.len() as u64;
+                            stats.packets_received      .fetch_add(1,   Ordering::Relaxed);
+                            stats.bytes_received        .fetch_add(len, Ordering::Relaxed);
+                            stats.current_second_packets.fetch_add(1,   Ordering::Relaxed);
+
+                            let raw = packet.data.to_vec();
+
+                            if tx.send(raw).is_err() {
+                                debug!("Capture channel closed; stopping thread");
+                                break;
+                            }
+                        }
+                        Err(pcap::Error::TimeoutExpired) => {
+                            continue;
+                        }
+                        Err(e) => {
+                            stats.packets_dropped_app.fetch_add(1, Ordering::Relaxed);
+                            warn!("Capture read error: {}", e);
+                        }
+                    }
+                }
+
+                info!("Capture thread exiting");
+            })
+            .expect("Failed to spawn rubix-capture thread");
+    }
+
     // ── Packet parsing ────────────────────────────────────────────────────────
 
     /// Parse raw Ethernet frame → typed Packet.
     ///
-    /// FIX: All pattern bindings use `ref` to borrow instead of move,
-    /// allowing `parsed.net` and `parsed.transport` to be read multiple
-    /// times (once for IPs/ports, once for TTL/flags).
-    ///
-    /// Returns None for non-IP frames or malformed data.
+    /// Uses etherparse 0.15+ API (parsed.net / NetHeaders).
+    /// All inner bindings use `ref` for double-borrow of net and transport.
     #[inline]
     fn parse_packet(data: &[u8]) -> Option<Packet> {
         let parsed = etherparse::PacketHeaders::from_ethernet_slice(data).ok()?;
 
-        // ── Network layer: extract IP addresses + TTL ─────────────────────────
-        // Use `ref` on all inner bindings so we don't move out of `parsed.net`.
+        // ── Network layer ─────────────────────────────────────────────────────
         let (src_ip, dst_ip, ttl) = match &parsed.net {
             Some(etherparse::NetHeaders::Ipv4(ref ip, _)) => (
                 IpAddr::V4(Ipv4Addr::from(ip.source)),
@@ -152,13 +242,10 @@ impl WindowsCapture {
                 IpAddr::V6(Ipv6Addr::from(ip.destination)),
                 Some(ip.hop_limit),
             ),
-            // Non-IP frame (ARP, VLAN, etc.) — skip silently
             _ => return None,
         };
 
-        // ── Transport layer: extract ports + protocol ─────────────────────────
-        // Use `ref` on all inner bindings so we don't move out of
-        // `parsed.transport` — we need it again below for TCP flags.
+        // ── Transport layer ───────────────────────────────────────────────────
         let (src_port, dst_port, protocol) = match &parsed.transport {
             Some(etherparse::TransportHeader::Tcp(ref tcp)) => (
                 tcp.source_port,
@@ -170,17 +257,8 @@ impl WindowsCapture {
                 udp.destination_port,
                 Protocol::Udp,
             ),
-            Some(etherparse::TransportHeader::Icmpv4(_)) => (
-                0,
-                0,
-                Protocol::Icmp,
-            ),
-            Some(etherparse::TransportHeader::Icmpv6(_)) => (
-                0,
-                0,
-                Protocol::Icmpv6,
-            ),
-            // Unknown or missing transport
+            Some(etherparse::TransportHeader::Icmpv4(_)) => (0, 0, Protocol::Icmp),
+            Some(etherparse::TransportHeader::Icmpv6(_)) => (0, 0, Protocol::Icmpv6),
             _ => (0, 0, Protocol::Other(0)),
         };
 
@@ -194,11 +272,8 @@ impl WindowsCapture {
             data.len(),
         );
 
-        // Populate TTL (safe: extracted by ref above, no move)
         pkt.ttl = ttl;
 
-        // ── TCP flags ─────────────────────────────────────────────────────────
-        // Second read of parsed.transport — safe because we used `ref` above.
         if let Some(etherparse::TransportHeader::Tcp(ref tcp)) = parsed.transport {
             pkt.flags.syn = tcp.syn;
             pkt.flags.ack = tcp.ack;
@@ -222,31 +297,24 @@ impl CaptureBackend for WindowsCapture {
         }
 
         let device = Self::resolve_interface(&self.config.interface)?;
-        let cap    = self.open_capture(device)?;
+        let cap    = Self::open_capture(&self.config, device)?;
 
+        let (tx, rx) = mpsc::sync_channel::<Vec<u8>>(CHANNEL_CAPACITY);
+
+        // Install receiver before starting thread.
         {
-            let mut guard = self.capture.lock().await;
-            *guard = Some(cap);
+            let mut guard = self.receiver.lock().expect("receiver mutex poisoned");
+            *guard = Some(rx);
         }
 
+        Self::spawn_capture_thread(
+            cap,
+            tx,
+            self.stats.clone(),
+            self.running.clone(),
+        );
+
         self.running.store(true, Ordering::SeqCst);
-
-        // ── Per-second packet counter reset ───────────────────────────────────
-        // Background task resets current_second_packets every 1s so the
-        // main loop can compute a live pps figure cheaply.
-        let stats   = self.stats.clone();
-        let running = self.running.clone();
-
-        tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(1));
-
-            while running.load(Ordering::Relaxed) {
-                interval.tick().await;
-                stats.current_second_packets.store(0, Ordering::Relaxed);
-            }
-        });
-
         info!("Packet capture started on {}", self.config.interface);
         Ok(())
     }
@@ -258,55 +326,41 @@ impl CaptureBackend for WindowsCapture {
 
         self.running.store(false, Ordering::SeqCst);
 
-        // Dropping Capture closes the pcap device handle
-        let mut guard = self.capture.lock().await;
+        let mut guard = self.receiver.lock().expect("receiver mutex poisoned");
         *guard = None;
 
         info!("Packet capture stopped on {}", self.config.interface);
         Ok(())
     }
 
+    /// Non-blocking packet read — never stalls the async executor.
+    ///
+    /// The `Mutex` is held only for a single `try_recv()` call (nanoseconds).
     async fn next_packet(&mut self) -> Option<Packet> {
         if !self.running.load(Ordering::SeqCst) {
             return None;
         }
 
-        let capture = self.capture.clone();
-        let stats   = self.stats.clone();
-
-        // pcap::next_packet() is blocking — run on blocking thread pool
-        // so async runtime workers are never stalled waiting on I/O.
-        let raw = spawn_blocking(move || {
-            let mut guard = capture.blocking_lock();
-            let cap       = guard.as_mut()?;
-
-            match cap.next_packet() {
-                Ok(packet) => {
-                    let len = packet.data.len() as u64;
-                    stats.packets_received      .fetch_add(1,   Ordering::Relaxed);
-                    stats.bytes_received        .fetch_add(len, Ordering::Relaxed);
-                    stats.current_second_packets.fetch_add(1,   Ordering::Relaxed);
-                    Some(packet.data.to_vec())
-                }
-                Err(pcap::Error::TimeoutExpired) => {
-                    // Normal — no packet arrived within the timeout window
-                    None
-                }
-                Err(e) => {
-                    stats.packets_dropped.fetch_add(1, Ordering::Relaxed);
-                    debug!("Capture read error: {}", e);
-                    None
-                }
+        let raw = {
+            let guard = self.receiver.lock().expect("receiver mutex poisoned");
+            match guard.as_ref() {
+                None => return None,
+                Some(rx) => match rx.try_recv() {
+                    Ok(raw)                         => raw,
+                    Err(TryRecvError::Empty)        => return None,
+                    Err(TryRecvError::Disconnected) => {
+                        warn!("Capture channel disconnected unexpectedly");
+                        drop(guard);
+                        self.running.store(false, Ordering::SeqCst);
+                        return None;
+                    }
+                },
             }
-        })
-        .await
-        .ok()??;
+        };
 
-        // Parse on calling thread — pure memory ops, no I/O, very cheap
         match Self::parse_packet(&raw) {
             Some(pkt) => Some(pkt),
             None => {
-                // Valid frame but not IP (ARP etc.) — count as filtered
                 self.stats.packets_filtered.fetch_add(1, Ordering::Relaxed);
                 None
             }
@@ -314,14 +368,15 @@ impl CaptureBackend for WindowsCapture {
     }
 
     fn stats(&self) -> CaptureStats {
-        let pps = self.stats.current_second_packets.load(Ordering::Relaxed);
+        let pps          = self.stats.current_second_packets.load(Ordering::Relaxed);
+        let kernel_drops = self.stats.packets_dropped_kernel.load(Ordering::Relaxed);
+        let app_drops    = self.stats.packets_dropped_app   .load(Ordering::Relaxed);
 
         CaptureStats {
             packets_received:     self.stats.packets_received.load(Ordering::Relaxed),
-            packets_dropped:      self.stats.packets_dropped .load(Ordering::Relaxed),
+            packets_dropped:      kernel_drops.saturating_add(app_drops),
             packets_filtered:     self.stats.packets_filtered.load(Ordering::Relaxed),
             bytes_received:       self.stats.bytes_received  .load(Ordering::Relaxed),
-            // pps × avg_frame_size(1500B) × 8 bits ÷ 1_000_000 bps_per_mbps
             interface_speed_mbps: pps.saturating_mul(1500 * 8) / 1_000_000,
         }
     }

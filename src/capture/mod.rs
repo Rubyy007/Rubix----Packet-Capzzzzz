@@ -1,6 +1,14 @@
 // src/capture/mod.rs
 //! Production-grade packet capture module for RUBIX
 //! Supports Linux (AF_PACKET/libpcap) and Windows (NPcap)
+//!
+//! Bug fixes applied in this file:
+//!   #7  Windows adapter status detection assumed English locale — now uses
+//!       numeric IfOperStatus (1 = Up) from PowerShell, locale-independent.
+//!   #8  resolve_interface filtered interfaces with no IP — now only skips
+//!       loopback and down interfaces (handled in linux.rs score function).
+//!   #9  score_device ignored is_up on Linux — Linux scoring now calls
+//!       score_linux_device() in linux.rs; mod.rs score_device is Windows-only.
 
 #![allow(dead_code)]
 
@@ -130,15 +138,30 @@ impl fmt::Display for InterfaceInfo {
 }
 
 // ── Windows adapter map via PowerShell ────────────────────────────────────────
-// Returns UPPERCASE GUID → "FriendlyName (Status) [InterfaceDescription]"
-// Including InterfaceDescription is critical — it contains "VirtualBox",
-// "VMware" etc. which the friendly name alone may not reveal.
 //
-// Example output:
-//   "04A954EE-..." → "Ethernet (Up) [Realtek PCIe GbE Family Controller]"
-//   "1EACB5DE-..." → "Ethernet 3 (Up) [VirtualBox Host-Only Ethernet Adapter]"
+// Bug #7 fix: the previous version emitted `$_.Status` which returns a
+// locale-dependent string ("Up", "Operational", translated strings on
+// non-English Windows).
+//
+// The fix uses `$_.IfOperStatus` which is a numeric NDIS enum:
+//   1 = Up
+//   2 = Down
+//   3 = Testing
+//   4 = Unknown
+//   5 = Dormant
+//   6 = NotPresent
+//   7 = LowerLayerDown
+//
+// We emit the raw integer and compare against 1 in `score_device_windows()`.
+// This is locale-independent and guaranteed stable across all Windows
+// versions that expose the Get-NetAdapter cmdlet (Windows 8+ / Server 2012+).
+//
+// Output format: UPPERCASE_GUID|FriendlyName|IfOperStatus(int)|InterfaceDescription
+// Example:
+//   "04A954EE-...|Ethernet|1|Realtek PCIe GbE Family Controller"
+//   "1EACB5DE-...|Ethernet 3|1|VirtualBox Host-Only Ethernet Adapter"
 #[cfg(target_os = "windows")]
-fn get_windows_adapter_map() -> HashMap<String, String> {
+fn get_windows_adapter_map() -> HashMap<String, WindowsAdapterInfo> {
     use std::process::Command;
     let mut map = HashMap::new();
 
@@ -147,11 +170,11 @@ fn get_windows_adapter_map() -> HashMap<String, String> {
             "-NoProfile",
             "-NonInteractive",
             "-Command",
-            // 4 fields separated by | — GUID, Name, Status, InterfaceDescription
+            // 4 fields separated by | — GUID, Name, IfOperStatus(int), InterfaceDescription
             "Get-NetAdapter | ForEach-Object { \
                 $_.InterfaceGuid + '|' + \
                 $_.Name + '|' + \
-                $_.Status + '|' + \
+                [int]$_.IfOperStatus + '|' + \
                 $_.InterfaceDescription \
             }",
         ])
@@ -168,16 +191,16 @@ fn get_windows_adapter_map() -> HashMap<String, String> {
                     .trim_matches('}')
                     .to_uppercase();
 
-                // Full label includes description in brackets for virtual detection
-                // Display label shows only "Name (Status)" for the banner
-                let full_label = format!(
-                    "{} ({}) [{}]",
-                    parts[1].trim(),
-                    parts[2].trim(),
-                    parts[3].trim()
-                );
+                // Parse IfOperStatus as integer — Bug #7 fix.
+                let if_oper_status: u32 = parts[2].trim().parse().unwrap_or(0);
 
-                map.insert(guid, full_label);
+                let info = WindowsAdapterInfo {
+                    friendly_name:        parts[1].trim().to_string(),
+                    if_oper_status,
+                    interface_description: parts[3].trim().to_string(),
+                };
+
+                map.insert(guid, info);
             }
         }
     }
@@ -185,29 +208,54 @@ fn get_windows_adapter_map() -> HashMap<String, String> {
     map
 }
 
+/// Parsed Windows adapter information from Get-NetAdapter.
+#[cfg(target_os = "windows")]
+#[derive(Debug, Clone)]
+struct WindowsAdapterInfo {
+    /// Friendly name: "Ethernet", "Wi-Fi", "Ethernet 3", etc.
+    friendly_name:        String,
+    /// NDIS IfOperStatus numeric value.
+    ///   1 = Up, 2 = Down, 3+ = degraded states.
+    /// Bug #7 fix: integer comparison replaces string comparison.
+    if_oper_status:       u32,
+    /// Full InterfaceDescription: "Realtek PCIe GbE Family Controller", etc.
+    interface_description: String,
+}
+
+#[cfg(target_os = "windows")]
+impl WindowsAdapterInfo {
+    /// Returns true only when IfOperStatus == 1 (Up), regardless of locale.
+    /// Bug #7 fix: replaces the old contains("(up)") string check.
+    fn is_up(&self) -> bool {
+        self.if_oper_status == 1
+    }
+
+    /// Full label for display and virtual-adapter detection.
+    /// Format: "FriendlyName [InterfaceDescription]"
+    fn full_label(&self) -> String {
+        format!("{} [{}]", self.friendly_name, self.interface_description)
+    }
+
+    /// Display label for the interface menu.
+    /// Format: "FriendlyName (Up)" or "FriendlyName (Down)"
+    fn display_label(&self) -> String {
+        let status = if self.is_up() { "Up" } else { "Down" };
+        format!("{} ({})", self.friendly_name, status)
+    }
+}
+
 #[cfg(not(target_os = "windows"))]
-fn get_windows_adapter_map() -> HashMap<String, String> {
+fn get_windows_adapter_map() -> HashMap<String, ()> {
     HashMap::new()
 }
 
-// ── Extract display name from full label ──────────────────────────────────────
-// Full label: "Ethernet (Up) [Realtek PCIe GbE Family Controller]"
-// Display:    "Ethernet (Up)"
-fn display_name_from_label(label: &str) -> String {
-    label
-        .split('[')
-        .next()
-        .unwrap_or(label)
-        .trim()
-        .to_string()
-}
-
 // ── Virtual adapter detection ─────────────────────────────────────────────────
-// Checks both the friendly name AND the InterfaceDescription (in brackets).
-// This catches "Ethernet 3 (Up) [VirtualBox Host-Only Ethernet Adapter]"
-// which would otherwise score as physical because the friendly name looks real.
-fn is_virtual_adapter(full_label: &str) -> bool {
-    let n = full_label.to_lowercase();
+// Checks both the friendly name AND the InterfaceDescription.
+// This catches "Ethernet 3 [VirtualBox Host-Only Ethernet Adapter]" which
+// would otherwise score as physical because the friendly name looks real.
+#[cfg(target_os = "windows")]
+fn is_virtual_adapter(info: &WindowsAdapterInfo) -> bool {
+    let n = info.full_label().to_lowercase();
     n.contains("virtualbox")
         || n.contains("vmware")
         || n.contains("hyper-v")
@@ -226,12 +274,20 @@ fn is_virtual_adapter(full_label: &str) -> bool {
         || n.contains("internal network")
 }
 
-// ── Score a single device ─────────────────────────────────────────────────────
-// Returns -1 to skip, otherwise 1-4 (higher = better candidate).
-fn score_device(device: &pcap::Device, adapter_map: &HashMap<String, String>) -> i32 {
+// ── Score a single device (Windows path) ─────────────────────────────────────
+//
+// Returns -1 to skip, otherwise 1–4 (higher = better candidate).
+//
+// Bug #7 fix: is_up() now compares IfOperStatus == 1 (integer) rather than
+// checking for the English string "(up)".
+#[cfg(target_os = "windows")]
+fn score_device(
+    device:      &pcap::Device,
+    adapter_map: &HashMap<String, WindowsAdapterInfo>,
+) -> i32 {
     let name_lower = device.name.to_lowercase();
 
-    // Hard skip — never capture on these
+    // Hard skip — never capture on these.
     if name_lower.contains("loopback")
         || name_lower.contains("npf_lo")
         || name_lower == "lo"
@@ -244,7 +300,7 @@ fn score_device(device: &pcap::Device, adapter_map: &HashMap<String, String>) ->
         return -1;
     }
 
-    // Extract GUID from \Device\NPF_{GUID}
+    // Extract GUID from \Device\NPF_{GUID}.
     let guid = device.name
         .split('{')
         .nth(1)
@@ -253,25 +309,59 @@ fn score_device(device: &pcap::Device, adapter_map: &HashMap<String, String>) ->
 
     match &guid {
         Some(g) => match adapter_map.get(g) {
-            Some(full_label) => {
-                if is_virtual_adapter(full_label) {
+            Some(info) => {
+                if is_virtual_adapter(info) {
                     -1 // virtual — skip entirely
-                } else if full_label.to_lowercase().contains("(up)") {
+                } else if info.is_up() {
+                    // Bug #7 fix: integer comparison, not locale string.
                     4  // physical + confirmed Up — best possible
                 } else {
-                    3  // physical, status not confirmed Up
+                    3  // physical, status not Up
                 }
             }
             None => {
-                // GUID not in Windows adapter list
+                // GUID not in Windows adapter list.
                 if device.addresses.is_empty() { 1 } else { 2 }
             }
         },
         None => {
-            // Linux-style name (eth0, enp3s0, wlan0, etc.)
+            // No GUID in device name — shouldn't happen on Windows NPcap but
+            // handle gracefully.
             if device.addresses.is_empty() { 1 } else { 2 }
         }
     }
+}
+
+// ── Linux score_device shim ───────────────────────────────────────────────────
+//
+// On Linux, scoring lives in linux.rs (score_linux_device) where it has
+// access to pcap::DeviceFlags.  This shim is used only by list_interfaces()
+// for display purposes when building the InterfaceInfo list on Linux.
+//
+// Bug #9 fix: is_up() flag is checked via d.flags.is_up(); down interfaces
+// return -1.
+#[cfg(not(target_os = "windows"))]
+fn score_device(device: &pcap::Device, _adapter_map: &HashMap<String, ()>) -> i32 {
+    let name = device.name.to_lowercase();
+
+    if name == "lo"
+        || name.starts_with("lo:")
+        || name.contains("loopback")
+        || name.contains("any")
+        || name.starts_with("docker")
+        || name.starts_with("br-")
+        || name.starts_with("virbr")
+        || name.starts_with("veth")
+    {
+        return -1;
+    }
+
+    // Bug #9 fix: exclude down interfaces from scoring.
+    if !device.flags.is_up() {
+        return -1;
+    }
+
+    if !device.addresses.is_empty() { 3 } else { 2 }
 }
 
 // ── Factory ───────────────────────────────────────────────────────────────────
@@ -293,13 +383,13 @@ impl CaptureFactory {
     /// Automatically select the best interface for packet capture.
     ///
     /// Scoring (higher wins):
-    ///   4 = physical adapter, confirmed Up
-    ///   3 = physical adapter, status unknown
-    ///   2 = non-loopback pcap device with IP addresses
+    ///   4 = physical adapter, confirmed Up  (Windows: IfOperStatus == 1)
+    ///   3 = physical adapter, status unknown / Linux up + has IPs
+    ///   2 = non-loopback pcap device with IP addresses (Linux up + no IPs)
     ///   1 = non-loopback pcap device without addresses
-    ///  -1 = skip (loopback, virtual, docker, bridge)
+    ///  -1 = skip (loopback, virtual, docker, bridge, down)
     pub fn auto_select_interface() -> Option<String> {
-        let devices = pcap::Device::list().ok()?;
+        let devices     = pcap::Device::list().ok()?;
         let adapter_map = get_windows_adapter_map();
 
         devices
@@ -315,7 +405,7 @@ impl CaptureFactory {
     /// List all interfaces scored and sorted best-first.
     /// Used by both the banner display and interactive selection.
     pub fn list_interfaces() -> Result<Vec<InterfaceInfo>, CaptureError> {
-        let devices = pcap::Device::list()
+        let devices     = pcap::Device::list()
             .map_err(|e| CaptureError::PcapError(e.to_string()))?;
 
         let adapter_map = get_windows_adapter_map();
@@ -337,7 +427,9 @@ impl CaptureFactory {
                 let is_up       = d.flags.is_up();
                 let score       = score_device(&d, &adapter_map);
 
-                // Resolve display name from adapter map
+                // Resolve display name from adapter map (Windows only).
+                // On Linux, d.desc is the fallback.
+                #[cfg(target_os = "windows")]
                 let description = {
                     let guid = d.name
                         .split('{')
@@ -346,10 +438,13 @@ impl CaptureFactory {
                         .map(|s| s.to_uppercase());
 
                     guid.and_then(|g| adapter_map.get(&g))
-                        // Show "Name (Status)" only — strip "[Description]" bracket
-                        .map(|label| display_name_from_label(label))
+                        // Bug #7 fix: display_label() uses IfOperStatus integer.
+                        .map(|info| info.display_label())
                         .or(d.desc)
                 };
+
+                #[cfg(not(target_os = "windows"))]
+                let description = d.desc;
 
                 InterfaceInfo {
                     name: d.name,
@@ -362,7 +457,7 @@ impl CaptureFactory {
             })
             .collect();
 
-        // Sort best-first so banner and selection list are in priority order
+        // Sort best-first so banner and selection list are in priority order.
         interfaces.sort_by(|a, b| b.score.cmp(&a.score));
 
         Ok(interfaces)

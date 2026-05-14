@@ -570,29 +570,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ── Kernel blocker + process blocklist ────────────────────────────────────
 
     let blocker        = Arc::new(PlatformBlocker::new());
+    // NOTE: WindowsBlocker::new() already called sweep_stale_filters() internally.
+    // That single-pass enumeration removed all orphaned RUBIX-* filters from any
+    // previous session.  No per-IP force_unblock_ip loop is needed here.
     let proc_blocklist = ProcessBlocklist::new();
     let malicious_ips  = extract_malicious_ips_from_rules(&configs_dir);
 
-    // ── Startup sweep — remove orphaned filters from previous force-killed runs.
-    //
-    // Uses deterministic WFP keys — no enumeration, no Defender conflict.
-    // FWP_E_FILTER_NOT_FOUND is silently ignored so this is always safe.
-    // This guarantees a clean slate before installing fresh policy blocks.
-    info!("Sweeping orphaned kernel filters from previous session...");
-    let mut swept = 0usize;
-    for ip_str in &malicious_ips {
-        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-            match blocker.force_unblock_ip(ip).await {
-                Ok(())  => { swept += 1; }
-                Err(e)  => warn!(ip = %ip_str, error = %e, "Orphan sweep failed (non-fatal)"),
-            }
-        }
-    }
-    if swept > 0 {
-        info!(count = swept, "Orphaned filter sweep complete");
-    }
-
     // ── Install fresh policy blocks from rules.yaml ───────────────────────────
+
     let mut kernel_rules = 0usize;
     for ip_str in &malicious_ips {
         if let Ok(ip) = ip_str.parse::<IpAddr>() {
@@ -1025,29 +1010,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║                     SHUTTING DOWN RUBIX                          ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
+    println!();
 
-    // Remove all WFP filters — both tracked rules and any remaining orphans
-    // from rules.yaml that may not have been explicitly unblocked.
-    info!("Cleaning up kernel rules...");
-    if let Err(e) = blocker.cleanup().await {
-        error!(error = %e, "Kernel cleanup failed — manual flush may be needed");
-    }
-
-    // Force-sweep rules.yaml IPs in case any slipped through cleanup
-    // (e.g. process-block-originated rules that cleanup() missed).
-    for ip_str in &malicious_ips {
-        if let Ok(ip) = ip_str.parse::<IpAddr>() {
-            let _ = blocker.force_unblock_ip(ip).await;
-        }
-    }
+    // ── Step 1: Stop capture first.
+    //
+    // This MUST happen before printing FINAL STATISTICS.  capture.stop()
+    // triggers async tasks that emit tracing log lines ("Packet capture
+    // stopped", "Capture thread exiting").  If we print the stats box first,
+    // those log lines interleave into the box borders.
+    //
+    // Snapshot runtime metrics before stopping so elapsed is accurate.
+    let elapsed = start_time.elapsed().as_secs_f64();
+    let avg_pps = packet_count as f64 / elapsed.max(0.001);
 
     if timeout(Duration::from_secs(2), capture.stop()).await.is_err() {
         warn!("Capture did not stop within 2 seconds");
     }
 
-    let elapsed = start_time.elapsed().as_secs_f64();
-    let avg_pps = packet_count as f64 / elapsed.max(0.001);
+    // ── Step 2: Clean up kernel rules.
+    //
+    // blocker.cleanup() removes all tracked WFP filters and closes the engine
+    // session.  Because FWPM_SESSION_FLAG_DYNAMIC is set, WFP auto-removes
+    // any remaining filters when the session closes — no per-IP sweep needed.
+    info!("Cleaning up kernel rules...");
+    if let Err(e) = blocker.cleanup().await {
+        error!(error = %e, "Kernel cleanup failed — manual flush may be needed");
+    }
 
+    // ── Step 3: Print final statistics.
+    //
+    // All async tasks that could emit tracing output are done by this point.
+    // The box will be clean.
     println!();
     println!("┌─ FINAL STATISTICS ──────────────────────────────────────────────┐");
     println!("│ Total Packets:  {:<48} │", packet_count);

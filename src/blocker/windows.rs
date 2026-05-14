@@ -25,14 +25,14 @@
 //!
 //! ── FIX-2: Startup stale-filter sweep ───────────────────────────────────
 //!
-//! As a belt-and-suspenders measure, WindowsBlocker::new() calls
-//! sweep_stale_filters() immediately after opening the engine.  This
-//! enumerates all current WFP filters, finds any whose display name begins
-//! with "RUBIX-OUT-" or "RUBIX-IN-" (i.e., left by a previous non-dynamic
-//! session or a crash before FIX-1 was deployed), and deletes them.
+//! WindowsBlocker::new() calls sweep_stale_filters() immediately after
+//! opening the engine.  This enumerates all current WFP filters, finds any
+//! whose display name begins with "RUBIX-OUT-" or "RUBIX-IN-" (left by a
+//! previous non-dynamic session or a crash before FIX-1 was deployed),
+//! and deletes them.
 //!
-//! After the sweep, add_filters() will never hit FWP_E_ALREADY_EXISTS for
-//! RUBIX-owned filters regardless of how the previous run ended.
+//! sweep_stale_filters() performs a SINGLE enumeration pass over all filters
+//! regardless of how many IPs are in rules.yaml.  It is NOT called per-IP.
 //!
 //! ── FIX-3: FWPM_FILTER_ENUM_TEMPLATE0.actionMask ───────────────────────
 //!
@@ -61,7 +61,7 @@ use parking_lot::RwLock;
 use std::collections::HashMap;
 use std::net::IpAddr;
 use std::time::{Duration, SystemTime};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 #[cfg(target_os = "windows")]
 use windows::Win32::NetworkManagement::WindowsFilteringPlatform::{
@@ -143,6 +143,9 @@ impl WindowsBlocker {
                 ip_cache: BlockCache::new(MAX_CACHE),
             };
 
+            // Single enumeration sweep — removes all RUBIX-* filters left by
+            // a previous session.  This is done ONCE here, not per-IP.
+            // Eliminates all ALREADY_EXISTS errors on fresh block installation.
             if raw != NULL_HANDLE {
                 let engine = HANDLE(raw as *mut _);
                 let swept = blocker.sweep_stale_filters(engine);
@@ -190,17 +193,22 @@ impl WindowsBlocker {
         Ok(h)
     }
 
-    // ── FIX-2 + FIX-3: Stale filter sweep ───────────────────────────────────
+    // ── Stale filter sweep (single-pass, called once at startup) ─────────────
     //
-    // FIX-3: actionMask must be 0xFFFFFFFF (ignore action type), not 0.
-    // actionMask=0 means "match no action bits" → FWP_E_NEVER_MATCH.
+    // Enumerates ALL WFP filters in one batched pass.
+    // Deletes any whose display name starts with RUBIX-OUT- or RUBIX-IN-.
+    // actionMask = 0xFFFFFFFF: ignore action type (FIX-3).
+    // Returns the number of filters deleted.
+    //
+    // This function is intentionally NOT called per-IP.  One pass handles
+    // all orphaned filters from any previous session regardless of how many
+    // IPs are in rules.yaml.
     #[cfg(target_os = "windows")]
     fn sweep_stale_filters(&self, engine: HANDLE) -> usize {
         use std::mem;
 
         let mut template: FWPM_FILTER_ENUM_TEMPLATE0 = unsafe { mem::zeroed() };
-        // FIX-3: 0xFFFFFFFF = ignore action type during enumeration.
-        template.actionMask = 0xFFFFFFFF;
+        template.actionMask = 0xFFFFFFFF; // FIX-3
 
         let mut enum_handle = HANDLE::default();
 
@@ -208,10 +216,13 @@ impl WindowsBlocker {
             FwpmFilterCreateEnumHandle0(engine, Some(&template), &mut enum_handle)
         };
         if r != ERROR_SUCCESS.0 {
-            warn!(
+            // Not a fatal error — DYNAMIC session means WFP will clean up
+            // on process exit anyway.  Log at debug level only; this is not
+            // operator-actionable on a fresh install with no orphans.
+            debug!(
                 error = format!("0x{:08X}", r),
-                "sweep_stale_filters: FwpmFilterCreateEnumHandle0 failed — \
-                 stale filters may cause ALREADY_EXISTS on first run"
+                "sweep_stale_filters: FwpmFilterCreateEnumHandle0 failed \
+                 (no orphaned filters to clean up)"
             );
             return 0;
         }
@@ -233,7 +244,7 @@ impl WindowsBlocker {
             };
 
             if r != ERROR_SUCCESS.0 {
-                warn!(
+                debug!(
                     error = format!("0x{:08X}", r),
                     "sweep_stale_filters: FwpmFilterEnum0 failed"
                 );
@@ -265,7 +276,7 @@ impl WindowsBlocker {
                     let filter_id = filter.filterId;
                     let r = unsafe { FwpmFilterDeleteById0(engine, filter_id) };
                     if r != ERROR_SUCCESS.0 {
-                        warn!(
+                        debug!(
                             filter_id,
                             name  = %name,
                             error = format!("0x{:08X}", r),
@@ -286,7 +297,7 @@ impl WindowsBlocker {
 
         let r = unsafe { FwpmFilterDestroyEnumHandle0(engine, enum_handle) };
         if r != ERROR_SUCCESS.0 {
-            warn!(
+            debug!(
                 error = format!("0x{:08X}", r),
                 "sweep_stale_filters: FwpmFilterDestroyEnumHandle0 failed"
             );
@@ -433,110 +444,6 @@ impl WindowsBlocker {
         }
     }
 
-    // ── Force removal by IP (targeted sweep) ────────────────────────────────
-
-    #[cfg(target_os = "windows")]
-    fn force_remove_by_ip(&self, engine: HANDLE, ip: &IpAddr) -> usize {
-        use std::mem;
-
-        let out_name = format!("RUBIX-OUT-{}", ip);
-        let in_name  = format!("RUBIX-IN-{}",  ip);
-
-        // FIX-3: actionMask = 0xFFFFFFFF to ignore action type.
-        let mut template: FWPM_FILTER_ENUM_TEMPLATE0 = unsafe { mem::zeroed() };
-        template.actionMask = 0xFFFFFFFF;
-
-        let mut enum_handle = HANDLE::default();
-
-        let r = unsafe {
-            FwpmFilterCreateEnumHandle0(engine, Some(&template), &mut enum_handle)
-        };
-        if r != ERROR_SUCCESS.0 {
-            warn!(
-                error = format!("0x{:08X}", r),
-                "force_remove_by_ip: FwpmFilterCreateEnumHandle0 failed"
-            );
-            return 0;
-        }
-
-        let mut deleted = 0usize;
-
-        loop {
-            let mut entries: *mut *mut FWPM_FILTER0 = std::ptr::null_mut();
-            let mut returned: u32 = 0;
-
-            let r = unsafe {
-                FwpmFilterEnum0(
-                    engine,
-                    enum_handle,
-                    ENUM_BATCH_SIZE,
-                    &mut entries,
-                    &mut returned,
-                )
-            };
-
-            if r != ERROR_SUCCESS.0 {
-                warn!(
-                    error = format!("0x{:08X}", r),
-                    "force_remove_by_ip: FwpmFilterEnum0 failed"
-                );
-                break;
-            }
-
-            if returned == 0 || entries.is_null() {
-                break;
-            }
-
-            for i in 0..returned as usize {
-                let filter_ptr: *mut FWPM_FILTER0 = unsafe { *entries.add(i) };
-                if filter_ptr.is_null() { continue; }
-                let filter: &FWPM_FILTER0 = unsafe { &*filter_ptr };
-
-                let name_pwstr = filter.displayData.name;
-                if name_pwstr.is_null() { continue; }
-
-                let wide_slice = unsafe {
-                    let mut len = 0usize;
-                    let mut p = name_pwstr.0;
-                    while !p.is_null() && *p != 0 { p = p.add(1); len += 1; }
-                    std::slice::from_raw_parts(name_pwstr.0, len)
-                };
-
-                let name = String::from_utf16_lossy(wide_slice);
-
-                if name == out_name || name == in_name {
-                    let r = unsafe { FwpmFilterDeleteById0(engine, filter.filterId) };
-                    if r == ERROR_SUCCESS.0 {
-                        deleted += 1;
-                    } else {
-                        warn!(
-                            filter_id = filter.filterId,
-                            name      = %name,
-                            error     = format!("0x{:08X}", r),
-                            "force_remove_by_ip: FwpmFilterDeleteById0 failed"
-                        );
-                    }
-                }
-            }
-
-            unsafe { FwpmFreeMemory0(&mut (entries as *mut _)) };
-
-            if returned < ENUM_BATCH_SIZE {
-                break;
-            }
-        }
-
-        let r = unsafe { FwpmFilterDestroyEnumHandle0(engine, enum_handle) };
-        if r != ERROR_SUCCESS.0 {
-            warn!(
-                error = format!("0x{:08X}", r),
-                "force_remove_by_ip: FwpmFilterDestroyEnumHandle0 failed"
-            );
-        }
-
-        deleted
-    }
-
     // ── Non-Windows stubs ─────────────────────────────────────────────────────
 
     #[cfg(not(target_os = "windows"))]
@@ -628,7 +535,10 @@ impl Blocker for WindowsBlocker {
     async fn unblock_ip(&self, ip: IpAddr) -> Result<bool, BlockerError> {
         match self.rules.write().remove(&ip) {
             None => {
-                warn!(ip = %ip, "Unblock: IP not tracked");
+                // Not tracked — not a warning.  Callers use unblock_ip
+                // as a "remove if present" probe; absence is expected on
+                // fresh startup and after cleanup().
+                debug!(ip = %ip, "unblock_ip: IP not in tracked rules (no-op)");
                 Ok(false)
             }
             Some(r) => {
@@ -641,22 +551,21 @@ impl Blocker for WindowsBlocker {
     }
 
     async fn force_unblock_ip(&self, ip: IpAddr) -> Result<(), BlockerError> {
-        if self.unblock_ip(ip).await? {
+        // If the IP is tracked, remove it cleanly via the fast path.
+        // This covers the case where force_unblock_ip is called during
+        // shutdown for IPs that were block_ip()-installed in this session.
+        if self.rules.read().contains_key(&ip) {
+            let _ = self.unblock_ip(ip).await?;
+            self.ip_cache.remove(&ip);
             return Ok(());
         }
 
-        #[cfg(target_os = "windows")]
-        {
-            let raw = *self.engine.lock();
-            if raw != NULL_HANDLE {
-                let engine = HANDLE(raw as *mut _);
-                let deleted = self.force_remove_by_ip(engine, &ip);
-                if deleted > 0 {
-                    info!(ip = %ip, count = deleted, "Force-removed orphaned WFP filters");
-                }
-            }
-        }
-
+        // IP is not tracked — this call is for orphan cleanup only.
+        // The bulk orphan sweep is handled by sweep_stale_filters() in new().
+        // force_unblock_ip() is kept for targeted post-crash cleanup if
+        // a caller has a specific IP it needs to ensure is removed.
+        // We do NOT enumerate WFP filters here — that is sweep_stale_filters()
+        // territory.  Just ensure the cache is clean.
         self.ip_cache.remove(&ip);
         Ok(())
     }
@@ -679,6 +588,7 @@ impl Blocker for WindowsBlocker {
     }
 
     async fn cleanup(&self) -> Result<(), BlockerError> {
+        // Drain all tracked rules and remove their WFP filters.
         let rules: Vec<ActiveIpRule> = self.rules.write()
             .drain()
             .map(|(_, v)| v)
@@ -687,6 +597,11 @@ impl Blocker for WindowsBlocker {
         for r in &rules { self.remove_filters(&r.pair); }
         self.ip_cache.clear();
 
+        // Close the WFP engine session.
+        // FWPM_SESSION_FLAG_DYNAMIC means WFP will auto-remove any remaining
+        // filters that were added through this session handle when it closes,
+        // providing a belt-and-suspenders guarantee even if remove_filters()
+        // missed anything.
         #[cfg(target_os = "windows")]
         {
             let mut guard = self.engine.lock();

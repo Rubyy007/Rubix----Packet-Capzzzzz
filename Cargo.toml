@@ -46,7 +46,7 @@ futures     = "0.3"
 
 # ── Concurrency & caching ─────────────────────────────────────────────────────
 crossbeam-channel = "0.5"
-dashmap           = "6.0"
+dashmap           = "6.1"
 once_cell         = "1.19"
 parking_lot       = "0.12"
 
@@ -97,6 +97,7 @@ reqwest  = { version = "0.12", features = ["json", "rustls-tls"], optional = tru
 rusqlite = { version = "0.32", features = ["bundled"],            optional = true }
 metrics                     = { version = "0.23", optional = true }
 metrics-exporter-prometheus = { version = "0.15", optional = true }
+async-channel = "2.3"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Linux-specific dependencies ───────────────────────────────────────────────
