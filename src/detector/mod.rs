@@ -2,13 +2,49 @@
 //! Threat detection engine for RUBIX
 //!
 //! Design constraints (enforced throughout):
-//!   • Hot path (analyze_tcp / analyze_udp / analyze_icmp) must be zero-
+//!   • Hot path (analyze_tcp / analyze_udp / analyze) must be zero-
 //!     allocation. No Vec::push that reallocates, no format!, no Box.
 //!   • Lock-free: ThreatTracker is owned by the single packet-loop task.
 //!   • Alert suppression uses per-kind cooldowns, not a single global value.
 //!   • Trust decisions are made with exact name matching (O(1) hash lookup),
 //!     NOT prefix matching which is trivially bypassable by a malicious
 //!     process naming itself "brave_backdoor.exe".
+//!
+//! Self-IP protection (new):
+//!   LocalIpSet is built once at daemon startup by calling
+//!   enumerate_local_ips(), which queries pcap::Device::list() for every IP
+//!   address assigned to any local interface (IPv4 + IPv6).  It is passed as
+//!   &LocalIpSet into every analyze_* call.  Traffic whose src_ip matches any
+//!   local address is dropped before any ThreatTracker state is mutated.
+//!
+//!   Usage in the packet loop (main.rs or equivalent):
+//!
+//!     // ── Once at startup ───────────────────────────────────────────────
+//!     let local_ips = LocalIpSet::new(
+//!         enumerate_local_ips(),
+//!         &config.trusted_cidrs,   // Vec<String> from rubix.*.yaml
+//!     );
+//!     tracing::info!(
+//!         "Local IP set ({} addresses): {:?}",
+//!         local_ips.len(),
+//!         local_ips.addresses(),
+//!     );
+//!
+//!     // ── Inside the packet loop ────────────────────────────────────────
+//!     if let Some(event) = ScanDetector::analyze_tcp(
+//!         &mut tracker, src_ip, dst_port, &flags,
+//!         proc_name.as_deref(), is_ingress, &local_ips,
+//!     ) { /* handle threat */ }
+//!
+//!     if let Some(event) = ScanDetector::analyze_udp(
+//!         &mut tracker, src_ip, dst_port,
+//!         proc_name.as_deref(), is_ingress, &local_ips,
+//!     ) { /* handle threat */ }
+//!
+//!     if let Some(event) = PingDetector::analyze(
+//!         &mut tracker, src_ip, is_echo_request,
+//!         proc_name.as_deref(), is_ingress, &local_ips,
+//!     ) { /* handle threat */ }
 
 pub mod scan;
 pub mod ping;
@@ -16,7 +52,7 @@ pub mod tracker;
 
 pub use scan::ScanDetector;
 pub use ping::PingDetector;
-pub use tracker::ThreatTracker;
+pub use tracker::{ThreatTracker, LocalIpSet, enumerate_local_ips};
 
 use std::net::IpAddr;
 use std::time::Instant;
@@ -96,8 +132,8 @@ impl ThreatKind {
             ThreatKind::FinScan       => AlertKey::FinScan,
             ThreatKind::XmasScan      => AlertKey::XmasScan,
             ThreatKind::AckScan       => AlertKey::AckScan,
-            ThreatKind::WindowScan    => AlertKey::AckScan,   // share slot
-            ThreatKind::MaimonScan    => AlertKey::OsScan,    // share slot
+            ThreatKind::WindowScan    => AlertKey::AckScan,    // share slot
+            ThreatKind::MaimonScan    => AlertKey::OsScan,     // share slot
             ThreatKind::UdpScan       => AlertKey::UdpScan,
             ThreatKind::OsScan        => AlertKey::OsScan,
             ThreatKind::ServiceScan   => AlertKey::ConnectScan,

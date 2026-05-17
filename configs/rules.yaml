@@ -1,11 +1,29 @@
-# RUBIX Rules — evaluated in order, first match wins
-# Place Allow rules BEFORE Block rules for local/trusted networks
+# RUBIX Rules — evaluated in order, first match wins.
+#
+# Rule evaluation happens AFTER the threat detector.
+# The detector (scan/ping/flood detection) always runs regardless of these rules.
+# These rules control what the POLICY ENGINE does with matched traffic.
+#
+# Actions:
+#   Allow  — permit the packet, no block, no alert
+#   Alert  — log it, show in monitor, do NOT block
+#   Block  — kernel-level drop via WFP (Windows) or nftables (Linux)
+#
+# IMPORTANT: Place Allow rules BEFORE Block rules.
+# First match wins — if Allow matches, subsequent Block rules never run.
+
+# ── Allow rules ───────────────────────────────────────────────────────────────
 
 - id: "allow-local-network"
-  name: "Allow Local Network"
+  name: "Allow Local Network Traffic"
   enabled: true
   action: Allow
   conditions:
+    # Packets DESTINED TO local addresses are allowed by policy.
+    # Note: the threat detector still runs on these packets and will alert
+    # (but not block) on suspicious behavior from LAN devices.
+    # This rule prevents automatic WFP/nftables blocks for LAN traffic —
+    # LAN threat response is alert-only by design.
     dst_ips:
       - "192.168.0.0/16"
       - "10.0.0.0/8"
@@ -15,11 +33,15 @@
     protocols: []
     dst_ports: []
 
+# ── Block rules ───────────────────────────────────────────────────────────────
+
 - id: "block-malware-c2"
   name: "Block Known Malware C2 Servers"
   enabled: true
   action: Block
   conditions:
+    # These IPs are kernel-blocked at startup via WFP/nftables in addition
+    # to being matched here.  Update this list with current threat intel.
     dst_ips:
       - "185.230.125.100"
       - "94.102.61.78"
@@ -29,21 +51,21 @@
     dst_ports: []
 
 - id: "block-ransomware-ports"
-  name: "Block Ransomware Ports"
+  name: "Block Ransomware Propagation Ports"
   enabled: true
   action: Block
   conditions:
     dst_ports:
-      - 445    # SMB — primary ransomware propagation vector
-      - 3389   # RDP — brute force / lateral movement
+      - 445    # SMB — primary ransomware lateral movement vector (WannaCry, NotPetya)
+      - 3389   # RDP — brute force and remote exploitation
     protocols:
       - "tcp"
     dst_ips: []
     src_ips: []
 
 - id: "block-ssh-bruteforce"
-  name: "Block SSH Brute Force"
-  enabled: false
+  name: "Block Outbound SSH"
+  enabled: false               # Enable if you don't use SSH from this machine
   action: Block
   conditions:
     dst_ports:
@@ -53,15 +75,31 @@
     dst_ips: []
     src_ips: []
 
-- id: "block-malicious-dns"
-  name: "Block Malicious DNS Servers"
-  enabled: false
-  action: Block
+# ── Alert-only rules ──────────────────────────────────────────────────────────
+#
+# These log and show in the monitor without blocking.
+# Useful for visibility without disrupting traffic.
+
+- id: "alert-telnet"
+  name: "Alert on Telnet (unencrypted)"
+  enabled: true
+  action: Alert
   conditions:
     dst_ports:
-      - 53
+      - 23
     protocols:
-      - "udp"
-    dst_ips:
-      - "8.8.8.8"    # example only — remove or replace with actual malicious resolvers
+      - "tcp"
+    dst_ips: []
+    src_ips: []
+
+- id: "alert-ftp"
+  name: "Alert on FTP (unencrypted file transfer)"
+  enabled: true
+  action: Alert
+  conditions:
+    dst_ports:
+      - 21
+    protocols:
+      - "tcp"
+    dst_ips: []
     src_ips: []

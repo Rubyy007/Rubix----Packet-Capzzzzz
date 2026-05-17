@@ -8,6 +8,9 @@
 //! (#9), get_mut() fast path (#10), Release/Acquire shutdown flag (#11),
 //! FxHashMap/FxHashSet hot path (#12/#15), compile-time TTL const (#16),
 //! inotify/ReadDirectoryChangesW hot-reload (#17).
+//! Self-IP guard (#18): LocalIpSet built from pcap::Device::list() at startup.
+//! Export pipeline (#19): ExportDispatcher fans threat/block/alert events out
+//! to webhook, SQLite storage, and socket streaming backends.
 //!
 //! Config search order: <exe_dir>/configs/ → <exe_dir>/../configs/ →
 //! <exe_dir>/../../configs/ → ./configs/
@@ -21,8 +24,13 @@ mod logger;
 mod control;
 mod resolver;
 mod detector;
+mod export;
 
-use detector::{ScanDetector, PingDetector, ThreatTracker, ThreatEvent};
+use detector::{
+    ScanDetector, PingDetector, ThreatTracker, ThreatEvent,
+    LocalIpSet, enumerate_local_ips,
+};
+use export::{ExportDispatcher, ExportEvent};
 use policy::{PolicyEngine, PolicyReloader, PolicyWatcher, RuleAction};
 use config::loader::ConfigLoader;
 use blocker::{PlatformBlocker, Blocker, ProcessBlocklist, BlockOrigin};
@@ -125,7 +133,6 @@ fn proc_stats_insert_or_get<'a>(
     if map.contains_key(&pid) {
         return map.get_mut(&pid);
     }
-
     if map.len() >= MAX_PROC_ENTRIES {
         map.retain(|_, s| now.duration_since(s.last_active) <= PROC_TTL_DURATION);
     }
@@ -136,7 +143,6 @@ fn proc_stats_insert_or_get<'a>(
         warn!(pid, max = MAX_PROC_ENTRIES, "proc_stats full — dropping attribution");
         return None;
     }
-
     Some(map.entry(pid).or_insert_with(|| ProcStats::new(name.to_string())))
 }
 
@@ -268,18 +274,22 @@ pub async fn print_banner(
     bpf_filter:      &str,
     malicious_ips:   &[String],
     configs_dir:     &std::path::Path,
+    export_active:   bool,
 ) {
     println!();
     println!("╔══════════════════════════════════════════════════════════════╗");
     println!("║                                                              ║");
-    println!("║   ██████  ██    ██ ██████  ██ ██   ██                        ║");
-    println!("║   ██   ██ ██    ██ ██   ██ ██  ██ ██                         ║");
-    println!("║   ██████  ██    ██ ██████  ██   ███                          ║");
-    println!("║   ██   ██ ██    ██ ██   ██ ██  ██ ██                         ║");
-    println!("║   ██   ██  ██████  ██████  ██ ██   ██                        ║");
+    println!("║   ██████╗ ██╗   ██╗██████╗ ██╗██╗  ██╗                       ║");
+    println!("║   ██╔══██╗██║   ██║██╔══██╗██║╚██╗██╔╝                       ║");
+    println!("║   ██████╔╝██║   ██║██████╔╝██║ ╚███╔╝                        ║");
+    println!("║   ██╔══██╗██║   ██║██╔══██╗██║ ██╔██╗                        ║");
+    println!("║   ██║  ██║╚██████╔╝██████╔╝██║██╔╝ ██╗                       ║");
+    println!("║   ╚═╝  ╚═╝ ╚═════╝ ╚═════╝ ╚═╝╚═╝  ╚═╝                       ║");
     println!("║                                                              ║");
-    println!("║              RUBIX by Uniq                                   ║");
-    println!("║          Network Defense Engine v1.0.0                       ║");
+    println!("║        Advanced Packet Monitoring & Defense Engine           ║");
+    println!("║            Real-Time Threat Detection Pipeline               ║");
+    println!("║                                                              ║");
+    println!("║                 Network Defense Engine v1.0.0                ║");
     println!("║                                                              ║");
     println!("╚══════════════════════════════════════════════════════════════╝");
     println!();
@@ -323,6 +333,8 @@ pub async fn print_banner(
             "DISABLED (set log_normal_traffic: true to enable)".to_string()
         });
     println!("│ Hot Reload     : {:<43} │", "ENABLED (rules.yaml)");
+    println!("│ Export         : {:<43} │",
+        if export_active { "ENABLED" } else { "DISABLED" });
     println!("└──────────────────────────────────────────────────────────────┘");
     println!();
     sleep(Duration::from_millis(250)).await;
@@ -390,6 +402,9 @@ pub async fn print_banner(
     println!("[*] Run 'rubix-cli monitor' in another terminal for live stats");
     println!("[*] Run 'rubix-cli logs' in another terminal for live log stream");
     println!("[*] Run 'rubix-cli logs normal' for normal traffic log");
+    if export_active {
+        println!("[*] Export pipeline active — events flowing to configured backends");
+    }
     println!();
 }
 
@@ -553,8 +568,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let normal_sample_divisor: u64   = config.logging.normal_sample_divisor.max(1);
     let normal_ring_capacity:  usize = config.logging.normal_ring_capacity.max(1).min(2048);
 
-    // ── Policy engine ─────────────────────────────────────────────────────────
+    // ── Self-IP guard ─────────────────────────────────────────────────────────
+    let local_ips = LocalIpSet::new(
+        enumerate_local_ips(),
+        &config.trusted_cidrs,
+    );
+    info!(
+        count = local_ips.len(),
+        addrs = ?local_ips.addresses(),
+        "Self-IP guard active — these addresses are excluded from threat detection",
+    );
 
+    // ── Export pipeline ───────────────────────────────────────────────────────
+    //
+    // Constructed before the packet loop.  If export.enabled = false in config
+    // (the default), ExportDispatcher is a no-op with zero overhead.
+    // Configure in rubix.*.yaml under the `export:` key.
+    let exporter = ExportDispatcher::build(&config.export).await
+        .unwrap_or_else(|e| {
+            warn!(error = %e, "Export pipeline failed to initialise — running without export");
+            ExportDispatcher::default()
+        });
+    let export_active = exporter.is_active();
+
+    // ── Policy engine ─────────────────────────────────────────────────────────
     let policy_engine = Arc::new(PolicyEngine::new());
     let rules_yaml    = configs_dir.join("rules.yaml").to_string_lossy().into_owned();
     let reloader      = Arc::new(PolicyReloader::new(policy_engine.clone(), rules_yaml));
@@ -568,15 +605,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Kernel blocker + process blocklist ────────────────────────────────────
-
     let blocker        = Arc::new(PlatformBlocker::new());
-    // NOTE: WindowsBlocker::new() already called sweep_stale_filters() internally.
-    // That single-pass enumeration removed all orphaned RUBIX-* filters from any
-    // previous session.  No per-IP force_unblock_ip loop is needed here.
     let proc_blocklist = ProcessBlocklist::new();
     let malicious_ips  = extract_malicious_ips_from_rules(&configs_dir);
-
-    // ── Install fresh policy blocks from rules.yaml ───────────────────────────
 
     let mut kernel_rules = 0usize;
     for ip_str in &malicious_ips {
@@ -591,12 +622,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // ── Resolver ──────────────────────────────────────────────────────────────
-
     let resolver = Arc::new(ProcessResolver::new());
     info!("Process resolver initialized");
 
     // ── Interface selection ───────────────────────────────────────────────────
-
     let interface_name = if config.capture_interface == "auto" {
         match CaptureFactory::auto_select_interface() {
             Some(iface) => { info!(interface = %iface, "Auto-selected interface"); iface }
@@ -626,10 +655,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &interface_name, &interface_label,
         &bpf_filter_display, &malicious_ips,
         &configs_dir,
+        export_active,
     ).await;
 
     // ── Capture ───────────────────────────────────────────────────────────────
-
     let shared_stats: Arc<RwLock<LiveStats>> = Arc::new(RwLock::new(LiveStats::default()));
 
     let mut capture = CaptureFactory::create(CaptureConfig {
@@ -643,7 +672,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     capture.start().await?;
 
     // ── Control server ────────────────────────────────────────────────────────
-
     let ctrl_handler = Arc::new(CommandHandler::new(
         blocker.clone(),
         proc_blocklist.clone(),
@@ -656,7 +684,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("Control server started");
 
     // ── Shutdown flag ─────────────────────────────────────────────────────────
-
     let running = Arc::new(AtomicBool::new(true));
     {
         let r = running.clone();
@@ -744,19 +771,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let proc_name  = proc_info.as_ref().map(|p| p.name.as_str());
                 let is_ingress = is_ingress_packet(packet.src_ip, packet.dst_ip);
 
+                // ── Threat detection ──────────────────────────────────────────
                 let threat: Option<ThreatEvent> = match packet.protocol {
                     crate::types::Protocol::Tcp => ScanDetector::analyze_tcp(
                         &mut threat_tracker, packet.src_ip, packet.dst_port,
-                        &packet.flags, proc_name, is_ingress,
+                        &packet.flags, proc_name, is_ingress, &local_ips,
                     ),
                     crate::types::Protocol::Udp => ScanDetector::analyze_udp(
                         &mut threat_tracker, packet.src_ip, packet.dst_port,
-                        proc_name, is_ingress,
+                        proc_name, is_ingress, &local_ips,
                     ),
                     crate::types::Protocol::Icmp | crate::types::Protocol::Icmpv6 =>
                         PingDetector::analyze(
                             &mut threat_tracker, packet.src_ip,
-                            true, proc_name, is_ingress,
+                            true, proc_name, is_ingress, &local_ips,
                         ),
                     _ => None,
                 };
@@ -780,6 +808,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         &format!("{}:{}", threat.kind.as_str(), threat.detail),
                     );
                     alert_count = alert_count.saturating_add(1);
+
                     if let Some(ref info) = proc_info {
                         if let Some(s) = proc_stats.get_mut(&info.pid) {
                             s.alerted       = s.alerted.saturating_add(1);
@@ -787,6 +816,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             s.last_active   = now_instant;
                         }
                     }
+
+                    // ── Export threat event ───────────────────────────────────
+                    exporter.export_threat(
+                        &threat.src_ip.to_string(),
+                        "local",
+                        packet.src_port,
+                        packet.dst_port,
+                        &packet.protocol.to_string(),
+                        proc_name.unwrap_or("unknown"),
+                        &format!("{}:{}", threat.kind.as_str(), threat.detail),
+                        threat.severity.as_str(),
+                    ).await;
                 }
 
                 if packet_count % 1_000 == 0 {
@@ -821,12 +862,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     let proc_label = proc_info.as_ref()
                         .map(|p| format!("{}({})", p.name, p.pid))
                         .unwrap_or_else(|| "unknown".into());
+                    let detail = format!("proc-block={} reason={:?}", proc_label, reason);
 
                     AlertLogger::log_block(
                         &packet.src_ip.to_string(), &packet.dst_ip.to_string(),
                         packet.src_port, packet.dst_port,
-                        &packet.protocol.to_string(),
-                        &format!("proc-block={} reason={:?}", proc_label, reason),
+                        &packet.protocol.to_string(), &detail,
                     );
                     push_log_entry(
                         &mut recent_logs, LogLevel::Block,
@@ -836,6 +877,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         proc_name.unwrap_or("unknown"),
                         &format!("process-blocked: {:?}", reason),
                     );
+
+                    // ── Export block event ────────────────────────────────────
+                    exporter.export_block(
+                        &packet.src_ip.to_string(),
+                        &packet.dst_ip.to_string(),
+                        packet.src_port,
+                        packet.dst_port,
+                        &packet.protocol.to_string(),
+                        proc_name.unwrap_or("unknown"),
+                        &detail,
+                    ).await;
 
                 } else {
                     match policy_engine.evaluate(&packet, proc_name) {
@@ -853,21 +905,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let proc_label = proc_info.as_ref()
                                 .map(|p| format!("{}({})", p.name, p.pid))
                                 .unwrap_or_else(|| "unknown".into());
+                            let detail = format!("proc={}", proc_label);
 
                             AlertLogger::log_block(
                                 &packet.src_ip.to_string(), &packet.dst_ip.to_string(),
                                 packet.src_port, packet.dst_port,
-                                &packet.protocol.to_string(),
-                                &format!("proc={}", proc_label),
+                                &packet.protocol.to_string(), &detail,
                             );
                             push_log_entry(
                                 &mut recent_logs, LogLevel::Block,
                                 &packet.src_ip.to_string(), &packet.dst_ip.to_string(),
                                 packet.src_port, packet.dst_port,
                                 &packet.protocol.to_string(),
-                                proc_name.unwrap_or("unknown"),
-                                &format!("proc={}", proc_label),
+                                proc_name.unwrap_or("unknown"), &detail,
                             );
+
+                            // ── Export block event ────────────────────────────
+                            exporter.export_block(
+                                &packet.src_ip.to_string(),
+                                &packet.dst_ip.to_string(),
+                                packet.src_port,
+                                packet.dst_port,
+                                &packet.protocol.to_string(),
+                                proc_name.unwrap_or("unknown"),
+                                &detail,
+                            ).await;
                         }
 
                         RuleAction::Alert => {
@@ -884,21 +946,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                             let proc_label = proc_info.as_ref()
                                 .map(|p| format!("{}({})", p.name, p.pid))
                                 .unwrap_or_else(|| "unknown".into());
+                            let detail = format!("proc={}", proc_label);
 
                             AlertLogger::log_alert(
                                 &packet.src_ip.to_string(), &packet.dst_ip.to_string(),
                                 packet.src_port, packet.dst_port,
-                                &packet.protocol.to_string(),
-                                &format!("proc={}", proc_label),
+                                &packet.protocol.to_string(), &detail,
                             );
                             push_log_entry(
                                 &mut recent_logs, LogLevel::Alert,
                                 &packet.src_ip.to_string(), &packet.dst_ip.to_string(),
                                 packet.src_port, packet.dst_port,
                                 &packet.protocol.to_string(),
-                                proc_name.unwrap_or("unknown"),
-                                &format!("proc={}", proc_label),
+                                proc_name.unwrap_or("unknown"), &detail,
                             );
+
+                            // ── Export alert event ────────────────────────────
+                            exporter.export_alert(
+                                &packet.src_ip.to_string(),
+                                &packet.dst_ip.to_string(),
+                                packet.src_port,
+                                packet.dst_port,
+                                &packet.protocol.to_string(),
+                                proc_name.unwrap_or("unknown"),
+                                &detail,
+                            ).await;
                         }
 
                         RuleAction::Allow => {
@@ -1012,14 +1084,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();
 
-    // ── Step 1: Stop capture first.
-    //
-    // This MUST happen before printing FINAL STATISTICS.  capture.stop()
-    // triggers async tasks that emit tracing log lines ("Packet capture
-    // stopped", "Capture thread exiting").  If we print the stats box first,
-    // those log lines interleave into the box borders.
-    //
-    // Snapshot runtime metrics before stopping so elapsed is accurate.
     let elapsed = start_time.elapsed().as_secs_f64();
     let avg_pps = packet_count as f64 / elapsed.max(0.001);
 
@@ -1027,20 +1091,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("Capture did not stop within 2 seconds");
     }
 
-    // ── Step 2: Clean up kernel rules.
-    //
-    // blocker.cleanup() removes all tracked WFP filters and closes the engine
-    // session.  Because FWPM_SESSION_FLAG_DYNAMIC is set, WFP auto-removes
-    // any remaining filters when the session closes — no per-IP sweep needed.
     info!("Cleaning up kernel rules...");
     if let Err(e) = blocker.cleanup().await {
         error!(error = %e, "Kernel cleanup failed — manual flush may be needed");
     }
 
-    // ── Step 3: Print final statistics.
-    //
-    // All async tasks that could emit tracing output are done by this point.
-    // The box will be clean.
     println!();
     println!("┌─ FINAL STATISTICS ──────────────────────────────────────────────┐");
     println!("│ Total Packets:  {:<48} │", packet_count);
@@ -1048,14 +1103,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("│ Total Alerts:   {:<48} │", alert_count);
     println!("│ Average Rate:   {:<48} │", format!("{:.0} pps", avg_pps));
     println!("│ Runtime:        {:<48} │", format!("{:.1} seconds", elapsed));
+    if export_active {
+        println!("│ Export drops:   {:<48} │",
+            format!("webhook={} socket_clients={}",
+                exporter.webhook_drop_count(),
+                exporter.socket_client_count()));
+    }
     println!("└──────────────────────────────────────────────────────────────────┘");
 
     println!();
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║                                                                  ║");
-    println!("║         GOODBYE BUDDY! RUBIX IS SIGNING OFF...                   ║");
-    println!("║                                                                  ║");
-    println!("║              Stay safe out there!                                ║");
+    println!("║                         RUBIX HAS SIGNED OFF                     ║");
+    println!("║                   Stay safe out there, operator.                 ║");
     println!("║                                                                  ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
     println!();

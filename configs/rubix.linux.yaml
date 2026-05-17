@@ -1,4 +1,4 @@
-# RUBIX Linux Configuration — overrides common config
+# RUBIX Linux Configuration — overrides rubix.common.yaml
 
 mode: "Block"
 capture_interface: "auto"
@@ -6,7 +6,10 @@ promiscuous: true
 buffer_size_mb: 64
 timeout_ms: 10
 snaplen: 65535
-bpf_filter: ~                  # null — auto-built from block list at startup
+bpf_filter: ~
+
+# Add specific trusted hosts here (e.g. your router: "192.168.1.1/32")
+trusted_cidrs: []
 
 fast_path:
   enable_sampling: false
@@ -20,6 +23,7 @@ blocking:
   block_timeout_seconds: 3600
   default_action: "drop"
   auto_cleanup: true
+  flush_on_exit: false
 
 logging:
   level: "info"
@@ -27,3 +31,18 @@ logging:
   json_format: true
   max_file_size_mb: 100
   rotation_count: 5
+  console_output: true
+  log_normal_traffic: false
+  normal_sample_divisor: 100
+  normal_ring_capacity: 200
+  normal_channel_depth: 4096
+
+export:
+  enabled: false
+  webhook_url: ~
+  storage_path: ~              # e.g. "/var/lib/rubix/events.db"
+  socket_addr: ~               # e.g. "127.0.0.1:9877"
+  batch_size: 50
+  flush_interval_secs: 10
+  webhook_timeout_secs: 5
+  webhook_retry_count: 3

@@ -1,13 +1,37 @@
 # RUBIX Common Configuration — shared across all platforms
-# Platform-specific files (rubix.linux.yaml, rubix.windows.yaml) override these values
+# Platform-specific files (rubix.linux.yaml, rubix.windows.yaml) override these values.
+#
+# Resolution order:
+#   1. rubix.<platform>.yaml  (platform-specific — highest priority)
+#   2. rubix.common.yaml      (this file — fallback)
+#   3. Built-in defaults      (last resort if no file found)
 
-mode: "Block"
-capture_interface: "auto"
+# ── Capture ───────────────────────────────────────────────────────────────────
+
+mode: "Block"               # Block | Monitor | Off
+capture_interface: "auto"   # "auto" = scoring system picks best physical adapter
 promiscuous: true
 buffer_size_mb: 64
 timeout_ms: 10
 snaplen: 65535
-bpf_filter: ~                  # null — auto-built from block list at startup
+bpf_filter: ~               # null = auto-built from rules.yaml block list at startup
+
+# ── Trusted CIDRs ─────────────────────────────────────────────────────────────
+#
+# Additional IP ranges to exclude from threat detection entirely.
+# Your own machine's interface IPs are always excluded automatically.
+#
+# Use this for:
+#   • VPN ranges you own:       "100.64.0.0/10"  (Tailscale/WireGuard)
+#   • Lab subnets you control:  "203.0.113.0/24"
+#   • Specific trusted hosts:   "192.168.1.1/32" (your router)
+#
+# Note: RFC-1918 (192.168.x, 10.x, 172.16-31.x) is NOT auto-whitelisted —
+# LAN devices are monitored for threats.  Add specific trusted LAN IPs here
+# if you want to exclude them (e.g. your router, NAS, printer).
+trusted_cidrs: []
+
+# ── Fast path ─────────────────────────────────────────────────────────────────
 
 fast_path:
   enable_sampling: false
@@ -15,14 +39,61 @@ fast_path:
   enable_aggregation: false
   aggregation_window_ms: 1000
 
+# ── Blocking ──────────────────────────────────────────────────────────────────
+
 blocking:
   enabled: true
-  block_timeout_seconds: 3600
+  iptables_chain: "RUBIX"       # Linux only — ignored on Windows
+  block_timeout_seconds: 3600   # 0 = permanent
   default_action: "drop"
   auto_cleanup: true
+  flush_on_exit: false
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 
 logging:
   level: "info"
   json_format: true
   max_file_size_mb: 100
   rotation_count: 5
+  console_output: true
+
+  # ── Normal-traffic logging ──────────────────────────────────────────────
+  #
+  # When log_normal_traffic: true, allowed packets are sampled and written to:
+  #   traffic.log             (file)
+  #   rubix-cli logs normal   (live stream)
+  #
+  # normal_sample_divisor:   1 = every packet, 100 = 1% (default)
+  # normal_ring_capacity:    in-memory ring size for CLI display (1–2048)
+  # normal_channel_depth:    async writer queue — drops silently if full
+  #                          (hot path never blocks)
+  log_normal_traffic: false
+  normal_sample_divisor: 100
+  normal_ring_capacity: 200
+  normal_channel_depth: 4096
+
+# ── Export pipeline ───────────────────────────────────────────────────────────
+#
+# Ships threat/block/alert events to external systems.
+# All backends are optional — enable only what you need.
+#
+# Backends:
+#   webhook_url    — HTTP POST batched events (Slack, Discord, custom API, etc.)
+#   storage_path   — SQLite audit log on disk (requires --features storage)
+#   socket_addr    — live JSON stream over TCP (connect with: nc 127.0.0.1 9877)
+#
+# Example webhook targets:
+#   Slack:   https://hooks.slack.com/services/T.../B.../...
+#   Discord: https://discord.com/api/webhooks/.../...
+#   Custom:  http://your-siem.internal/rubix/events
+
+export:
+  enabled: false
+  webhook_url: ~              # null = disabled
+  storage_path: ~             # null = disabled
+  socket_addr: ~              # null = disabled
+  batch_size: 50
+  flush_interval_secs: 10
+  webhook_timeout_secs: 5
+  webhook_retry_count: 3

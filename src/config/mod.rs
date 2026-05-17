@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::path::PathBuf;
 
+use crate::export::ExportConfig;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RubixConfig {
     pub mode: OperationMode,
@@ -17,6 +19,24 @@ pub struct RubixConfig {
     pub timeout_ms: u64,
     pub snaplen: u32,
     pub bpf_filter: Option<String>,
+
+    /// Additional CIDR ranges to treat as fully trusted — traffic from these
+    /// addresses is silently ignored by the threat detector.
+    ///
+    /// YAML example:
+    ///   trusted_cidrs:
+    ///     - "100.64.0.0/10"   # Tailscale / WireGuard
+    ///     - "203.0.113.0/24"  # your lab subnet
+    ///
+    /// Invalid CIDR strings are logged as warnings and skipped.
+    #[serde(default)]
+    pub trusted_cidrs: Vec<String>,
+
+    /// Export pipeline — ships threat/block/alert events to external systems.
+    /// Disabled by default (zero overhead when not configured).
+    #[serde(default)]
+    pub export: ExportConfig,
+
     #[serde(default)]
     pub fast_path: FastPathConfig,
     #[serde(default)]
@@ -124,39 +144,19 @@ pub struct LoggingConfig {
     #[serde(default = "default_true")]
     pub console_output: bool,
 
-    // ── Normal-traffic logging ─────────────────────────────────────────────
-    //
-    // When `log_normal_traffic` is false (default) the Allow arm of the
-    // packet loop is a true no-op — zero overhead.
-    //
-    // When true, every 1-in-`normal_sample_divisor` allowed packet is:
-    //   • pushed into the in-memory `normal_logs` ring (capped at
-    //     `normal_ring_capacity`), and
-    //   • sent to the async file writer via a non-blocking channel.
-    //
-    // `normal_sample_divisor = 1`  → log every allowed packet (full capture)
-    // `normal_sample_divisor = 100`→ log 1% (default — low overhead)
-    //
-    // The file writer batches writes; it never touches a Mutex from the
-    // hot path.
     /// Enable logging of allowed (normal) traffic.
     #[serde(default)]
     pub log_normal_traffic: bool,
 
     /// Log 1-in-N allowed packets.  1 = every packet, 100 = 1%.
-    /// Values below 1 are clamped to 1.
     #[serde(default = "default_normal_sample_divisor")]
     pub normal_sample_divisor: u64,
 
     /// Maximum entries in the in-memory normal-traffic ring shown by the CLI.
-    /// Separate from `LOG_RING_CAPACITY` (security events) so normal traffic
-    /// never evicts Block/Alert/Threat entries.
     #[serde(default = "default_normal_ring_capacity")]
     pub normal_ring_capacity: usize,
 
     /// Channel depth for the async normal-traffic file writer.
-    /// If the channel fills (writer can't keep up) sends are silently dropped
-    /// — this is intentional: the hot path must never block.
     #[serde(default = "default_normal_channel_depth")]
     pub normal_channel_depth: usize,
 }
@@ -212,6 +212,8 @@ impl Default for RubixConfig {
             timeout_ms:        10,
             snaplen:           65535,
             bpf_filter:        None,
+            trusted_cidrs:     Vec::new(),
+            export:            ExportConfig::default(),
             fast_path:         FastPathConfig::default(),
             blocking:          BlockingConfig::default(),
             logging:           LoggingConfig::default(),

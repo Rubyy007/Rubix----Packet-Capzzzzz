@@ -1,4 +1,4 @@
-# RUBIX Windows Configuration — overrides common config
+# RUBIX Windows Configuration — overrides rubix.common.yaml
 
 mode: "Block"
 capture_interface: "auto"      # auto = scoring system picks best physical adapter
@@ -6,7 +6,11 @@ promiscuous: true
 buffer_size_mb: 64
 timeout_ms: 10
 snaplen: 65535
-bpf_filter: ~                  # null — auto-built from block list at startup
+bpf_filter: ~                  # null = auto-built from rules.yaml block list at startup
+
+# Add specific trusted hosts here (e.g. your router: "192.168.1.1/32")
+# RFC-1918 ranges are NOT auto-trusted — LAN devices are monitored.
+trusted_cidrs: []
 
 fast_path:
   enable_sampling: false
@@ -19,6 +23,7 @@ blocking:
   block_timeout_seconds: 3600
   default_action: "drop"
   auto_cleanup: true
+  flush_on_exit: false
 
 logging:
   level: "info"
@@ -26,23 +31,44 @@ logging:
   json_format: true
   max_file_size_mb: 100
   rotation_count: 5
+  console_output: true
 
   # ── Normal-traffic logging ──────────────────────────────────────────────
   #
-  # Set log_normal_traffic: true to see all allowed packets in:
-  #   rubix-cli logs --ring normal
+  # Set log_normal_traffic: true to see allowed packets in:
+  #   rubix-cli logs normal
   #   C:\ProgramData\rubix\logs\traffic.log
   #
-  # normal_sample_divisor controls how many packets are sampled:
-  #   1   = every allowed packet (full capture — high volume)
-  #   10  = 1-in-10 (10%)
-  #   100 = 1-in-100 (1%) — default, low overhead
-  #
-  # normal_ring_capacity: how many entries the in-memory ring holds (1–2048).
-  # normal_channel_depth: async writer queue depth. If the writer falls
-  #   behind, excess entries are silently dropped (hot path never blocks).
-  #
+  # normal_sample_divisor:
+  #   1   = every allowed packet (full capture — very high volume)
+  #   10  = 1-in-10  (10%)
+  #   100 = 1-in-100 (1%) — default, minimal overhead
   log_normal_traffic: true
   normal_sample_divisor: 100
   normal_ring_capacity: 200
   normal_channel_depth: 4096
+
+# ── Export pipeline ───────────────────────────────────────────────────────────
+#
+# Ships threat/block/alert events to external systems.
+# Set enabled: true and configure at least one backend.
+#
+# webhook_url examples:
+#   Slack:   https://hooks.slack.com/services/T.../B.../...
+#   Discord: https://discord.com/api/webhooks/.../...
+#
+# socket_addr — connect any program to receive live JSON events:
+#   Windows Terminal: nc 127.0.0.1 9877
+#   PowerShell:       Test-NetConnection -ComputerName 127.0.0.1 -Port 9877
+#
+# storage_path — SQLite audit log (requires cargo build --features storage)
+
+export:
+  enabled: false
+  webhook_url: ~
+  storage_path: ~              # e.g. "C:\\ProgramData\\rubix\\events.db"
+  socket_addr: ~               # e.g. "127.0.0.1:9877"
+  batch_size: 50
+  flush_interval_secs: 10
+  webhook_timeout_secs: 5
+  webhook_retry_count: 3
