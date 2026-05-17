@@ -1,0 +1,33 @@
+[package]
+name    = "rubix-dashboard"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "rubix-dashboard"
+path = "main.rs"
+
+[dependencies]
+# RUBIX types — imported directly from the main crate
+rubix = { path = "../..", default-features = false }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# HTTP + WebSocket server
+warp = "0.3"
+
+# Serialisation
+serde        = { version = "1", features = ["derive"] }
+serde_json   = "1"
+
+# Shared-state primitives
+parking_lot = "0.12"
+
+# Logging
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Date/time (already in main crate — re-used here)
+chrono = { version = "0.4", features = ["serde"] }
+futures-util = "0.3.32"

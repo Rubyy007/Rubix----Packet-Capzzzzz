@@ -1,0 +1,75 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+
+  --color-surface-dim: #10141a;
+  --color-inverse-primary: #00696e;
+  --color-inverse-on-surface: #2d3137;
+  --color-primary-fixed-dim: #47d9e2;
+  --color-outline-variant: #3c494a;
+  --color-secondary-fixed-dim: #a2c9ff;
+  --color-on-tertiary-fixed-variant: #693c00;
+  --color-tertiary-container: #ffab51;
+  --color-error-container: #93000a;
+  --color-outline: #859394;
+  --color-surface-container: #1c2026;
+  --color-surface-container-low: #181c22;
+  --color-surface-variant: #31353c;
+  --color-primary-container: #39d0d8;
+  --color-on-secondary-fixed: #001c38;
+  --color-surface-container-lowest: #0a0e14;
+  --color-on-primary-fixed-variant: #004f53;
+  --color-primary-fixed: #6bf6fe;
+  --color-secondary-fixed: #d3e4ff;
+  --color-on-primary-fixed: #002021;
+  --color-surface-bright: #353940;
+  --color-surface: #10141a;
+  --color-on-error-container: #ffdad6;
+  --color-primary: #5fecf5;
+  --color-secondary-container: #0071c7;
+  --color-on-primary-container: #005559;
+  --color-tertiary-fixed-dim: #ffb870;
+  --color-on-secondary-container: #f0f4ff;
+  --color-on-tertiary-fixed: #2c1600;
+  --color-on-secondary: #00315c;
+  --color-on-tertiary-container: #714100;
+  --color-secondary: #a2c9ff;
+  --color-on-surface-variant: #bbc9ca;
+  --color-on-primary: #003739;
+  --color-surface-container-high: #262a31;
+  --color-on-tertiary: #4a2800;
+  --color-inverse-surface: #dfe2eb;
+  --color-on-secondary-fixed-variant: #004882;
+  --color-tertiary: #ffd0a6;
+  --color-on-error: #690005;
+  --color-surface-tint: #47d9e2;
+  --color-surface-container-highest: #31353c;
+  --color-tertiary-fixed: #ffdcbe;
+  --color-on-surface: #dfe2eb;
+  --color-error: #ffb4ab;
+}
+
+@layer base {
+  body {
+    @apply bg-surface-dim text-on-surface font-sans antialiased;
+  }
+}
+
+.status-pulse {
+  box-shadow: 0 0 0 0 rgba(255, 180, 171, 0.7);
+  animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+  0% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 180, 171, 0.7); }
+  70% { transform: scale(1); box-shadow: 0 0 0 10px rgba(255, 180, 171, 0); }
+  100% { transform: scale(0.95); box-shadow: 0 0 0 0 rgba(255, 180, 171, 0); }
+}
+
+::-webkit-scrollbar { width: 4px; height: 4px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { @apply bg-surface-variant rounded-sm; }
+

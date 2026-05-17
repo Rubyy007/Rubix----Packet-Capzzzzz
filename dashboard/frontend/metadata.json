@@ -1,0 +1,8 @@
+{
+  "name": "Rubix Sentinel SOC",
+  "description": "High-density security operations center dashboard for threat monitoring and system control.",
+  "requestFramePermissions": [],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
