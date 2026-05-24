@@ -86,9 +86,6 @@ ipnetwork = "0.20"
 atty = "0.2.14"
 
 # ── Process blocking ──────────────────────────────────────────────────────────
-# sha2: SHA-256 fingerprinting for hash-based exe blocking (lazy, zero-cost
-#       when no hash blocks are registered).
-# hex:  encode/decode digests for CLI wire format and logging.
 sha2 = "0.10"
 hex  = "0.4"
 
@@ -98,6 +95,9 @@ rusqlite = { version = "0.32", features = ["bundled"],            optional = tru
 metrics                     = { version = "0.23", optional = true }
 metrics-exporter-prometheus = { version = "0.15", optional = true }
 async-channel = "2.3"
+axum          = "0.7"
+tower-http    = { version = "0.5", features = ["cors"] }
+getrandom     = "0.2"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # ── Linux-specific dependencies ───────────────────────────────────────────────
@@ -106,8 +106,6 @@ async-channel = "2.3"
 [target.'cfg(target_os = "linux")'.dependencies]
 nix    = { version = "0.29", features = ["socket", "net", "process", "user"] }
 libc   = "0.2"
-# procfs: /proc/net/{tcp,udp,tcp6,udp6} → inode → PID (resolver/linux.rs).
-# Also used by ProcessBlocklist::find_pids_for_exe / find_pids_for_hash.
 procfs = "0.16"
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -116,15 +114,8 @@ procfs = "0.16"
 
 [target.'cfg(target_os = "windows")'.dependencies]
 
-# `windows` crate — high-level safe bindings used by:
-#   resolver/windows.rs : GetExtendedTcpTable / GetExtendedUdpTable /
-#                         K32GetProcessImageFileNameW
-#   blocker/windows.rs  : WFP direct API (FwpmEngineOpen0, FwpmFilterAdd0, …)
-#
-# Feature notes:
-#   Win32_Security     — required for FWPM_SESSION0 / FWPM_FILTER0 structs
-#   Win32_System_Rpc   — required for FwpmEngineOpen0 (RPC auth constants);
-#                        without this feature the function is configured out
+# `windows` crate — high-level safe bindings.
+# Used by: resolver/windows.rs, blocker/windows.rs, banner.rs, preflight.rs
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
@@ -137,19 +128,44 @@ windows = { version = "0.58", features = [
     "Win32_System_Threading",
 ]}
 
-# `windows-sys` crate — low-level raw bindings used ONLY by:
-#   blocker/process.rs : ToolHelp32 enumeration (find_pids_for_exe /
-#                        find_pids_for_hash), OpenProcess,
-#                        QueryFullProcessImageNameW, GetExitCodeProcess
+# `windows-sys` crate — low-level raw bindings.
+# Used by: blocker/process.rs, preflight.rs (IsUserAnAdmin, LoadLibraryW,
+#          FreeLibrary).
 #
-# NOT used for WFP — all WFP calls go through the `windows` crate above.
+# FIX: added Win32_UI_Shell    — required for IsUserAnAdmin() in preflight.rs
+#      added Win32_System_LibraryLoader — required for LoadLibraryW /
+#                                         FreeLibrary in preflight.rs (Npcap
+#                                         presence check).
 windows-sys = { version = "0.52", features = [
     "Win32_Foundation",
     "Win32_Networking_WinSock",
     "Win32_Security",
+    "Win32_System_Console",
     "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
     "Win32_System_ProcessStatus",
     "Win32_System_Threading",
+    "Win32_UI_Shell",
+]}
+
+# ── Explicit x86_64-pc-windows-msvc target (mirrors the cfg block above) ──────
+#
+# Cargo evaluates both sections on Windows MSVC — they must be consistent.
+# This section previously diverged from the cfg block (missing several
+# features).  Now kept in sync so builds never fail due to missing features
+# depending on which section Cargo picks up first.
+
+[target.x86_64-pc-windows-msvc.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_System_Console",
+    "Win32_System_Diagnostics_ToolHelp",
+    "Win32_System_LibraryLoader",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
 ]}
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -164,7 +180,7 @@ metrics = ["dep:metrics", "dep:metrics-exporter-prometheus"]
 full    = ["webhook", "storage", "metrics"]
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Build profiles ────────────────────────────────────────════════════════════
+# ── Build profiles ────────────────────────────────────────────────────────────
 # ══════════════════════════════════════════════════════════════════════════════
 
 [profile.release]
@@ -173,8 +189,6 @@ lto             = "fat"
 codegen-units   = 1
 strip           = true
 panic           = "abort"
-# overflow-checks: wrapping arithmetic panics in release; all hot-path
-# counters use saturating_add() so this only catches genuine logic errors.
 overflow-checks = true
 
 [profile.dev]
@@ -203,7 +217,7 @@ opt-level     = 3
 codegen-units = 1
 
 # ══════════════════════════════════════════════════════════════════════════════
-# ── Package metadata ──────────────────────────────────────────────────────────
+# ── Package metadata ──────────────────────────────────────════════════════════
 # ══════════════════════════════════════════════════════════════════════════════
 
 [package.metadata.docs.rs]

@@ -37,6 +37,13 @@ pub struct RubixConfig {
     #[serde(default)]
     pub export: ExportConfig,
 
+    /// HTTP dashboard server.
+    /// Serves the live web UI and REST API on a configurable port.
+    /// Zero fast-path impact — runs in its own async task, reads LiveStats
+    /// via shared read lock only.
+    #[serde(default)]
+    pub dashboard: DashboardConfig,
+
     #[serde(default)]
     pub fast_path: FastPathConfig,
     #[serde(default)]
@@ -62,6 +69,50 @@ impl fmt::Display for OperationMode {
             OperationMode::Block   => write!(f, "Block"),
             OperationMode::Monitor => write!(f, "Monitor"),
             OperationMode::Off     => write!(f, "Off"),
+        }
+    }
+}
+
+// ── Dashboard ─────────────────────────────────────────────────────────────────
+
+/// HTTP dashboard configuration.
+///
+/// YAML example:
+///   dashboard:
+///     enabled: true
+///     host: "127.0.0.1"   # loopback only — safe default
+///     port: 7878
+///
+/// Security notes:
+///   A cryptographically random 256-bit token is generated at every engine
+///   start using OsRng.  It is printed ONCE to the terminal and rotates on
+///   every restart.  It is never read from config and never written to disk.
+///   To expose beyond loopback, set host: "0.0.0.0" — the token is still
+///   required for every request regardless of host setting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DashboardConfig {
+    /// Start the HTTP dashboard on engine boot.  Default: true.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+
+    /// Interface address to bind.
+    /// "127.0.0.1" → loopback only — safe default.
+    /// "0.0.0.0"   → all interfaces — token auth still required.
+    #[serde(default = "default_dashboard_host")]
+    pub host: String,
+
+    /// TCP port for the dashboard HTTP server.  Default: 7878.
+    #[serde(default = "default_dashboard_port")]
+    pub port: u16,
+
+}
+
+impl Default for DashboardConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            host:    default_dashboard_host(),
+            port:    default_dashboard_port(),
         }
     }
 }
@@ -192,6 +243,8 @@ fn default_rotation_count()        -> u32    { 5 }
 fn default_normal_sample_divisor() -> u64    { 100 }
 fn default_normal_ring_capacity()  -> usize  { 200 }
 fn default_normal_channel_depth()  -> usize  { 4096 }
+fn default_dashboard_host()        -> String { "127.0.0.1".to_string() }  // Fix 1: loopback default
+fn default_dashboard_port()        -> u16    { 7878 }
 
 fn default_log_path() -> PathBuf {
     #[cfg(target_os = "windows")]
@@ -214,6 +267,7 @@ impl Default for RubixConfig {
             bpf_filter:        None,
             trusted_cidrs:     Vec::new(),
             export:            ExportConfig::default(),
+            dashboard:         DashboardConfig::default(),
             fast_path:         FastPathConfig::default(),
             blocking:          BlockingConfig::default(),
             logging:           LoggingConfig::default(),

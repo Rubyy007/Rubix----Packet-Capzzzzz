@@ -45,11 +45,9 @@ use rubix::types::stats::{LiveStats, LogEntry, LogLevel};
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 /// How often the monitor loop polls the daemon (milliseconds).
-/// 500ms gives a snappy feel without hammering the IPC socket.
 const POLL_INTERVAL_MS: u64 = 500;
 
 /// How many recent pps samples to average for the displayed rate.
-/// Smooths out the 0-spike when traffic briefly drops between polls.
 const PPS_SMOOTH_WINDOW: usize = 3;
 
 // ── Platform: socket address ──────────────────────────────────────────────────
@@ -65,19 +63,6 @@ const SOCKET_ADDR: &str = "127.0.0.1:9876";
 const MAX_PROC_ROWS:   usize = 8;
 const MAX_THREAT_ROWS: usize = 5;
 
-// The exact number of lines render_dashboard() prints.
-// Count every println!/dln call in that function.
-// Must be kept in sync when render_dashboard() changes.
-//
-//  4  — header box (3 lines + blank)
-//  2  — status bar + blank
-//  5  — counters box (header + 3 data + footer)
-//  1  — blank
-//  MAX_PROC_ROWS + 4  — process box (header + col-header + divider + rows + footer)
-//  1  — blank
-//  MAX_THREAT_ROWS + 2 — threats box (header + rows + footer)
-//  1  — blank
-//  2  — footer line + blank
 const DASHBOARD_LINES: u16 = (4 + 2 + 5 + 1 + MAX_PROC_ROWS as u16 + 4 + 1
     + MAX_THREAT_ROWS as u16 + 2 + 1 + 2) as u16;
 
@@ -710,22 +695,10 @@ async fn cmd_logs(cmd: LogsCommand) {
 }
 
 // ── Monitor TUI ───────────────────────────────────────────────────────────────
-//
-// Fix strategy:
-//   • Use \x1B[H (cursor to top-left) + \x1B[J (clear to end of screen)
-//     instead of cursor-up-N-lines.  This works correctly on Windows
-//     Terminal, PowerShell, and CMD with VTP enabled — no line-count mismatch.
-//   • Poll every POLL_INTERVAL_MS (500ms) instead of 1000ms.
-//   • Smooth pps over PPS_SMOOTH_WINDOW samples to avoid the 0-spike.
-//   • Enter the alternate screen buffer (\x1B[?1049h) on start and restore
-//     (\x1B[?1049l) on exit so the dashboard doesn't scroll the terminal.
 
 async fn cmd_monitor() {
     let mut out = io::stdout();
 
-    // Enter alternate screen buffer + hide cursor.
-    // The alternate screen means the dashboard occupies its own virtual
-    // buffer; Ctrl+C restores the previous terminal content cleanly.
     if use_color() {
         let _ = write!(out, "\x1B[?1049h\x1B[?25l");
         let _ = out.flush();
@@ -733,21 +706,14 @@ async fn cmd_monitor() {
 
     let quit = make_quit_flag();
 
-    // Smoothed pps ring — last N samples averaged to hide traffic spikes.
     let mut pps_ring: std::collections::VecDeque<f64> =
         std::collections::VecDeque::with_capacity(PPS_SMOOTH_WINDOW);
 
-    // Track last packet count to detect whether the daemon published fresh data.
     let mut last_packet_count: u64 = u64::MAX;
 
     loop {
         if quit.load(Ordering::Relaxed) { break; }
 
-        // Move cursor to top-left and clear the screen every frame.
-        // \x1B[H  = cursor to row 1 col 1
-        // \x1B[2J = clear entire visible screen
-        // This is more reliable than cursor-up-N on Windows because it does
-        // not depend on counting output lines correctly.
         if use_color() {
             let _ = write!(out, "\x1B[H\x1B[2J");
         }
@@ -767,10 +733,6 @@ async fn cmd_monitor() {
                         let _ = out.flush();
                     }
                     Some(mut stats) => {
-                        // Smooth pps:
-                        //   If the daemon published a fresh snapshot (packet_count
-                        //   changed) use the reported pps.  Otherwise push 0 so
-                        //   the ring drains naturally over PPS_SMOOTH_WINDOW polls.
                         if stats.packet_count != last_packet_count {
                             pps_ring.push_back(stats.pps);
                         } else {
@@ -781,7 +743,6 @@ async fn cmd_monitor() {
                         }
                         last_packet_count = stats.packet_count;
 
-                        // Replace the raw pps with the smoothed average.
                         let smooth_pps = if pps_ring.is_empty() { 0.0 }
                             else { pps_ring.iter().sum::<f64>() / pps_ring.len() as f64 };
                         stats.pps = smooth_pps;
@@ -795,7 +756,6 @@ async fn cmd_monitor() {
         }
     }
 
-    // Restore: show cursor, leave alternate screen.
     if use_color() {
         let _ = write!(out, "\x1B[?25h\x1B[?1049l");
         let _ = out.flush();
@@ -814,17 +774,17 @@ fn render_dashboard(s: &LiveStats) {
         "\x1B[1;32m[ CLEAN  ]\x1B[0m"
     };
 
-    // ── Header (4 lines) ──────────────────────────────────────────────────────
+    // ── Header ────────────────────────────────────────────────────────────────
     println!("╔══════════════════════════════════════════════════════════════════╗");
     println!("║  \x1B[1mRUBIX LIVE MONITOR\x1B[0m   {}                                   ║", status_color);
     println!("║  Ctrl+C to exit                                                  ║");
     println!("╚══════════════════════════════════════════════════════════════════╝");
 
-    // ── Status bar (2 lines) ──────────────────────────────────────────────────
+    // ── Status bar ────────────────────────────────────────────────────────────
     println!(" |{}|  {:>7.0} pps", s.heartbeat, s.pps);
     println!();
 
-    // ── Live counters (5 lines) ───────────────────────────────────────────────
+    // ── Live counters ─────────────────────────────────────────────────────────
     println!("┌─ LIVE COUNTERS ──────────────────────────────────────────────────┐");
     println!("│  Packets  : {:>10}    Rate   : {:>8.0} pps                 │", s.packet_count, s.pps);
     println!("│  Blocked  : {:>10}    Avg    : {:>8.0} pps                 │", s.block_count, s.avg_pps);
@@ -833,33 +793,79 @@ fn render_dashboard(s: &LiveStats) {
 
     println!();
 
-    // ── Process table (MAX_PROC_ROWS + 4 lines) ───────────────────────────────
+    // ── Process table ─────────────────────────────────────────────────────────
+    //
+    // FIX: the previous code built blk_str / alrt_str as Strings containing
+    // ANSI escape codes, then inserted them with `{}` into a format string that
+    // also relied on column widths.  Rust's format width specifiers count raw
+    // bytes, not visible characters — the invisible escape bytes consumed column
+    // budget, pushing every subsequent field (name, unique_dsts, protocol_cnt)
+    // off the right edge of the box, making them appear blank.
+    //
+    // Fix: separate the ANSI code from the padded numeric string.  The {:>N}
+    // width specifier is applied only to the plain digit string; the color codes
+    // are emitted before/after the padded value outside of any width expression.
+    // The box width is now stable regardless of whether color is enabled.
+
     println!("┌─ TOP PROCESSES  (5 s window) ────────────────────────────────────┐");
     println!("│ {:>5} {:<22} {:>7} {:>8} {:>5} {:>5} {:>4} {:>3} │",
         "PID", "PROCESS", "PKTS", "BYTES", "BLK", "ALT", "DST", "PRO");
     println!("├──────────────────────────────────────────────────────────────────┤");
+
     for i in 0..MAX_PROC_ROWS {
         if let Some(p) = s.top_procs.get(i) {
             let name      = truncate_tilde(&p.name, 22);
             let bytes_str = fmt_bytes(p.bytes);
-            let blk_str = if p.blocked > 0 {
-                format!("\x1B[1;31m{:>5}\x1B[0m", format!("!{}", p.blocked))
-            } else { format!("{:>5}", "0") };
-            let alrt_str = if p.alerted > 0 {
-                format!("\x1B[1;33m{:>5}\x1B[0m", format!("!{}", p.alerted))
-            } else { format!("{:>5}", "0") };
-            println!("│ {:>5} {:<22} {:>7} {:>8} {} {} {:>4} {:>3} │",
-                p.pid, name, p.packets, bytes_str,
-                blk_str, alrt_str, p.unique_dsts, p.protocol_cnt);
+
+            // Blocked column — color applied outside the width specifier.
+            // {:>5} pads only the digit string; the ANSI codes add zero
+            // visible width.
+            let (blk_color, blk_reset) = if p.blocked > 0 && use_color() {
+                ("\x1B[1;31m", "\x1B[0m")
+            } else {
+                ("", "")
+            };
+            let blk_val = if p.blocked > 0 {
+                format!("!{}", p.blocked)
+            } else {
+                "0".to_string()
+            };
+
+            // Alerted column — same approach.
+            let (alt_color, alt_reset) = if p.alerted > 0 && use_color() {
+                ("\x1B[1;33m", "\x1B[0m")
+            } else {
+                ("", "")
+            };
+            let alt_val = if p.alerted > 0 {
+                format!("!{}", p.alerted)
+            } else {
+                "0".to_string()
+            };
+
+            // Print the row.  Every {} field here is either a plain padded
+            // number or a plain string — no ANSI codes inside width specifiers.
+            println!(
+                "│ {:>5} {:<22} {:>7} {:>8} {}{:>5}{} {}{:>5}{} {:>4} {:>3} │",
+                p.pid,
+                name,
+                p.packets,
+                bytes_str,
+                blk_color, blk_val, blk_reset,
+                alt_color,  alt_val, alt_reset,
+                p.unique_dsts,
+                p.protocol_cnt,
+            );
         } else {
             println!("│                                                                  │");
         }
     }
+
     println!("└──────────────────────────────────────────────────────────────────┘");
 
     println!();
 
-    // ── Recent threats (MAX_THREAT_ROWS + 2 lines) ────────────────────────────
+    // ── Recent threats ────────────────────────────────────────────────────────
     println!("┌─ RECENT THREATS ─────────────────────────────────────────────────┐");
     let total = s.recent_threats.len();
     for i in 0..MAX_THREAT_ROWS {
@@ -875,7 +881,7 @@ fn render_dashboard(s: &LiveStats) {
 
     println!();
 
-    // ── Footer (2 lines) ──────────────────────────────────────────────────────
+    // ── Footer ────────────────────────────────────────────────────────────────
     println!("\x1B[2m Refreshing every {}ms  │  rubix-cli monitor  │  Ctrl+C to exit\x1B[0m",
         POLL_INTERVAL_MS);
     println!();
@@ -890,9 +896,9 @@ fn render_monitor_error(msg: &str) {
     println!(" [!] Cannot reach daemon — {}", truncate_ellipsis(msg, 44));
     println!();
     println!("┌─ LIVE COUNTERS ──────────────────────────────────────────────────┐");
-    println!("│  \x1B[1;31m{:<66}\x1B[0m │", tpad(msg, 66));
-    println!("│                                                                  │");
-    println!("│                                                                  │");
+    println!("│  Packets  :           —    Rate   :        — pps                 │");
+    println!("│  Blocked  :           —    Avg    :        — pps                 │");
+    println!("│  Alerts   :           —    Uptime :        — sec                 │");
     println!("└──────────────────────────────────────────────────────────────────┘");
     println!();
     println!("┌─ TOP PROCESSES  (5 s window) ────────────────────────────────────┐");

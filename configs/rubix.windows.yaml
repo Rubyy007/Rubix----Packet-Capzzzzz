@@ -27,7 +27,7 @@ blocking:
 
 logging:
   level: "info"
-  file_path: "C:\\ProgramData\\rubix\\logs\\rubix.log"
+  file_path: "D:\\rubix\\logs\\rubix.log"
   json_format: true
   max_file_size_mb: 100
   rotation_count: 5
