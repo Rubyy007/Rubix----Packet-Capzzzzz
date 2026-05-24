@@ -1,46 +1,35 @@
 // src/resolver/linux.rs
 //! Linux process resolution via /proc.
 //!
-//! Algorithm (three-step inode chase):
+//! FIX: SnapshotResult is defined as Result<HashMap<FlowKey, ProcessInfo>>
+//! using the standard RandomState hasher.  This file previously built the
+//! map as FxHashMap (BuildHasherDefault<FxHasher>) and returned it directly,
+//! causing a type mismatch at every return site.
 //!
-//!   Step 1 — Read kernel socket tables from /proc/net/:
-//!     /proc/net/tcp   → IPv4 TCP: { local_address: SocketAddr, inode: u64 }
-//!     /proc/net/tcp6  → IPv6 TCP
-//!     /proc/net/udp   → IPv4 UDP
-//!     /proc/net/udp6  → IPv6 UDP
-//!     Result: inode_map: HashMap<u64, FlowKey>
+//! Fix: build with FxHashMap internally for performance (fast insertion
+//! during the /proc walk), then convert to a standard HashMap at the single
+//! return point via .into_iter().collect().  The conversion is O(n) and
+//! happens once per snapshot — negligible cost compared to /proc I/O.
 //!
-//!   Step 2 — Walk /proc/{pid}/fd/ for every running process:
-//!     Each fd entry is a symlink.  Sockets appear as "socket:[inode]".
-//!     Match the inode against inode_map.
-//!
-//!   Step 3 — Read process name from /proc/{pid}/stat (comm field).
-//!     comm is capped at 15 characters by the kernel.
-//!     Fallback: "pid:{pid}" if stat() fails (process exited mid-scan).
-//!
-//! Error handling:
-//!   Every fallible operation uses `let Ok(...) else { continue }`.
-//!   A process that exits during iteration, or an fd that can't be read
-//!   due to permissions, is silently skipped.  The snapshot returns whatever
-//!   it successfully collected — a partial result is correct and expected.
-//!
-//! Performance:
-//!   Typical cost: 2–10 ms depending on number of processes and open fds.
-//!   Called at most once per second from a background tokio task — never
-//!   from the packet-loop hot path.
+//! inode_map remains FxHashMap throughout — it is internal and never
+//! returned, so its hasher type is not constrained by SnapshotResult.
 
 use super::{FlowKey, ProcessInfo, Protocol, SnapshotResult};
 use rustc_hash::FxHashMap;
-use std::net::IpAddr;
+use std::collections::HashMap;
 
 pub(crate) fn snapshot() -> SnapshotResult {
-    // Pre-size for a typical Linux desktop: ~200 TCP + ~100 UDP sockets.
-    let mut map:       FxHashMap<FlowKey, ProcessInfo> =
-        FxHashMap::with_capacity_and_hasher(512, Default::default());
+    // ── Internal maps — FxHashMap for fast insertion during /proc walk ────────
+
+    // inode → FlowKey  (never returned; always FxHashMap)
     let mut inode_map: FxHashMap<u64, FlowKey> =
         FxHashMap::with_capacity_and_hasher(512, Default::default());
 
-    // ── Step 1: build inode → FlowKey map ────────────────────────────────────
+    // FlowKey → ProcessInfo  (FxHashMap internally; converted before return)
+    let mut fx_map: FxHashMap<FlowKey, ProcessInfo> =
+        FxHashMap::with_capacity_and_hasher(512, Default::default());
+
+    // ── Step 1: build inode → FlowKey from /proc/net ─────────────────────────
 
     if let Ok(entries) = procfs::net::tcp() {
         for entry in entries {
@@ -82,29 +71,22 @@ pub(crate) fn snapshot() -> SnapshotResult {
         }
     }
 
-    // Nothing to do if no sockets were found (unlikely but safe).
+    // Nothing to do if no sockets were found.
     if inode_map.is_empty() {
-        return Ok(map);
+        // FIX: collect empty FxHashMap → HashMap to match SnapshotResult type.
+        return Ok(fx_map.into_iter().collect());
     }
 
     // ── Step 2 + 3: walk /proc/{pid}/fd/, match inodes, read names ───────────
 
     let Ok(procs) = procfs::process::all_processes() else {
-        // /proc is unreadable — return whatever we have (empty map is fine).
-        return Ok(map);
+        return Ok(fx_map.into_iter().collect());
     };
 
     for proc_result in procs {
-        // Process may have exited between all_processes() and here — skip.
         let Ok(proc) = proc_result else { continue };
+        let Ok(fds)  = proc.fd()         else { continue };
 
-        // Read fd directory.  Fails for processes owned by other users when
-        // running without CAP_SYS_PTRACE, which is normal and expected.
-        let Ok(fds) = proc.fd() else { continue };
-
-        // Read comm from /proc/{pid}/stat.  Comm is limited to 15 chars by
-        // the kernel (TASK_COMM_LEN - 1).  If stat() fails (process exited),
-        // use "pid:{pid}" as a diagnostic fallback.
         let name: String = proc
             .stat()
             .map(|s| s.comm)
@@ -115,20 +97,20 @@ pub(crate) fn snapshot() -> SnapshotResult {
         for fd_result in fds {
             let Ok(fd) = fd_result else { continue };
 
-            // Only sockets have inodes in our map — pipes, files, etc. skip.
             if let procfs::process::FDTarget::Socket(inode) = fd.target {
                 if let Some(flow) = inode_map.get(&inode) {
-                    map.insert(
+                    fx_map.insert(
                         flow.clone(),
-                        ProcessInfo {
-                            pid,
-                            name: name.clone(),
-                        },
+                        ProcessInfo { pid, name: name.clone() },
                     );
                 }
             }
         }
     }
 
-    Ok(map)
+    // FIX: convert FxHashMap → HashMap<_, _, RandomState> to satisfy
+    // SnapshotResult = Result<HashMap<FlowKey, ProcessInfo>>.
+    // into_iter().collect() re-hashes each entry once — O(n), done once
+    // per snapshot.  The /proc I/O above dominates by orders of magnitude.
+    Ok(fx_map.into_iter().collect())
 }

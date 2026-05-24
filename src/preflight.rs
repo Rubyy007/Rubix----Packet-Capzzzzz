@@ -10,18 +10,13 @@
 //!   1. Administrator / root privilege
 //!   2. Packet-capture library present (Npcap on Windows, libpcap on Linux)
 //!
-//! Both checks are synchronous and allocation-minimal — they complete in < 5 ms
-//! and impose zero overhead on the normal fast path.
+//! FIX: has_required_capabilities() no longer uses libc::capget /
+//! libc::__user_cap_header_struct / libc::__user_cap_data_struct — those
+//! types are not exposed by the libc crate.  Instead we define the structs
+//! manually (matching linux/capability.h exactly) and invoke capget(2) via
+//! libc::syscall with SYS_capget.  This is the standard approach used by
+//! the `caps` crate and other Linux capability libraries.
 
-// ── Public entry point ────────────────────────────────────────────────────────
-
-/// Run all pre-flight checks.
-///
-/// If every check passes this function returns normally and the daemon
-/// continues to start.  If any check fails it prints a diagnostic message
-/// and calls `std::process::exit(1)` — it never panics or returns an error.
-///
-/// Call this as the absolute first line of `main()` before any other code.
 pub fn run() {
     check_privilege();
     check_capture_library();
@@ -33,9 +28,7 @@ pub fn run() {
 
 #[cfg(target_os = "windows")]
 fn check_privilege() {
-    if is_admin_windows() {
-        return;
-    }
+    if is_admin_windows() { return; }
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════════════╗");
@@ -65,20 +58,13 @@ fn check_privilege() {
 
 #[cfg(target_os = "windows")]
 fn is_admin_windows() -> bool {
-    // IsUserAnAdmin() — simplest correct UAC elevation check.
-    // Returns non-zero only when the current token has the Administrators
-    // group active (i.e. UAC elevation has been granted).
-    //
-    // windows-sys 0.52 exposes this under Win32_UI_Shell.
     use windows_sys::Win32::UI::Shell::IsUserAnAdmin;
     unsafe { IsUserAnAdmin() != 0 }
 }
 
 #[cfg(target_os = "linux")]
 fn check_privilege() {
-    if is_root_linux() || has_required_capabilities() {
-        return;
-    }
+    if is_root_linux() || has_required_capabilities() { return; }
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════════════╗");
@@ -111,36 +97,70 @@ fn check_privilege() {
 
 #[cfg(target_os = "linux")]
 fn is_root_linux() -> bool {
-    // SAFETY: getuid() is always safe — no preconditions, no failure mode.
+    // SAFETY: getuid() is always safe.
     unsafe { libc::getuid() == 0 }
 }
 
 #[cfg(target_os = "linux")]
 fn has_required_capabilities() -> bool {
-    // capget(2) — read effective capability set of the current thread.
-    // We need CAP_NET_RAW (13) for raw packet capture and
-    // CAP_NET_ADMIN (12) for firewall rule installation.
-    use libc::{capget, __user_cap_header_struct, __user_cap_data_struct};
+    // The libc crate does NOT expose capget(2) structs directly.
+    // We define them manually from linux/capability.h and call
+    // capget via libc::syscall(SYS_capget, ...).
+    //
+    // This matches the approach used by the `caps` crate internally.
+    //
+    // Struct layout (from linux/capability.h, unchanged since Linux 2.6.26):
+    //   __user_cap_header_struct { __u32 version; int pid; }
+    //   __user_cap_data_struct   { __u32 effective; __u32 permitted; __u32 inheritable; }
+    //
+    // Version _LINUX_CAPABILITY_VERSION_3 = 0x20080522 covers all 64 caps
+    // in two consecutive __user_cap_data_struct elements.
 
-    const LINUX_CAPABILITY_VERSION_3: u32 = 0x20080522;
+    #[repr(C)]
+    struct CapHeader {
+        version: u32,
+        pid:     i32,
+    }
+
+    #[repr(C)]
+    #[derive(Copy, Clone)]
+    struct CapData {
+        effective:   u32,
+        permitted:   u32,
+        inheritable: u32,
+    }
+
+    const VERSION_3:   u32 = 0x20080522;
     const CAP_NET_ADMIN: u32 = 12;
     const CAP_NET_RAW:   u32 = 13;
+    // SYS_capget on x86_64 = 125, on aarch64 = 90, on i686 = 184.
+    // libc::SYS_capget is the correct portable constant — use it directly.
 
-    let mut header = __user_cap_header_struct {
-        version: LINUX_CAPABILITY_VERSION_3,
-        pid: 0,
+    let mut header = CapHeader { version: VERSION_3, pid: 0 };
+    // Two elements: [0] = caps 0-31, [1] = caps 32-63.
+    // CAP_NET_ADMIN=12 and CAP_NET_RAW=13 are both in element [0].
+    let mut data = [CapData { effective: 0, permitted: 0, inheritable: 0 }; 2];
+
+    // SAFETY: SYS_capget is a well-defined Linux syscall.
+    //   arg1: pointer to CapHeader (matches kernel ABI for version 3)
+    //   arg2: pointer to CapData[2] (two elements for the 64-bit cap set)
+    // Both pointers are valid stack references for the duration of the call.
+    let rc = unsafe {
+        libc::syscall(
+            libc::SYS_capget,
+            &mut header as *mut CapHeader,
+            data.as_mut_ptr(),
+        )
     };
-    let mut data = [__user_cap_data_struct {
-        effective: 0, permitted: 0, inheritable: 0,
-    }; 2];
 
-    // SAFETY: capget is a well-defined Linux syscall with valid pointers.
-    let rc = unsafe { capget(&mut header, data.as_mut_ptr()) };
-    if rc != 0 { return false; }
+    if rc != 0 {
+        // syscall failed — assume no capabilities rather than panicking.
+        return false;
+    }
 
-    let eff_low       = data[0].effective;
-    let has_net_raw   = (eff_low >> CAP_NET_RAW)   & 1 == 1;
-    let has_net_admin = (eff_low >> CAP_NET_ADMIN)  & 1 == 1;
+    let eff           = data[0].effective;
+    let has_net_raw   = (eff >> CAP_NET_RAW)   & 1 == 1;
+    let has_net_admin = (eff >> CAP_NET_ADMIN)  & 1 == 1;
     has_net_raw && has_net_admin
 }
 
@@ -150,9 +170,7 @@ fn has_required_capabilities() -> bool {
 
 #[cfg(target_os = "windows")]
 fn check_capture_library() {
-    if npcap_installed() {
-        return;
-    }
+    if npcap_installed() { return; }
 
     eprintln!();
     eprintln!("╔══════════════════════════════════════════════════════════════════════╗");
@@ -189,23 +207,13 @@ fn check_capture_library() {
 
 #[cfg(target_os = "windows")]
 fn npcap_installed() -> bool {
-    // Probe for wpcap.dll using LoadLibraryW.
-    //
-    // FIX: In windows-sys 0.52, LoadLibraryW returns isize (the raw HMODULE),
-    // not a pointer type — so .is_null() does not exist.  The null sentinel
-    // for HMODULE in this crate version is 0isize.
-    //
-    // FIX: FreeLibrary in windows-sys 0.52 is in Win32::Foundation, not in
-    // Win32::System::LibraryLoader.  Import from the correct module.
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
     use windows_sys::Win32::Foundation::FreeLibrary;
+    use windows_sys::Win32::System::LibraryLoader::LoadLibraryW;
 
     let candidates: &[&str] = &[
-        // Npcap default install location
         "C:\\Windows\\System32\\Npcap\\wpcap.dll",
-        // WinPcap-compatible install location
         "C:\\Windows\\System32\\wpcap.dll",
     ];
 
@@ -215,11 +223,9 @@ fn npcap_installed() -> bool {
             .chain(std::iter::once(0))
             .collect();
 
-        // SAFETY: LoadLibraryW is a standard Win32 API.  wide is a valid
-        // null-terminated UTF-16 string.  We immediately free the handle.
+        // SAFETY: LoadLibraryW is a standard Win32 API.
+        // HMODULE in windows-sys 0.52 is isize; null sentinel = 0.
         let handle = unsafe { LoadLibraryW(wide.as_ptr()) };
-
-        // In windows-sys 0.52 HMODULE is isize.  Null = 0.
         if handle != 0 {
             unsafe { FreeLibrary(handle) };
             return true;
@@ -231,9 +237,7 @@ fn npcap_installed() -> bool {
 
 #[cfg(target_os = "linux")]
 fn check_capture_library() {
-    if libpcap_present() {
-        return;
-    }
+    if libpcap_present() { return; }
 
     let install_cmd = detect_package_manager_install_cmd();
 
@@ -275,8 +279,7 @@ fn libpcap_present() -> bool {
     ];
 
     for name in candidates {
-        // SAFETY: dlopen is a standard POSIX API.  name is a valid
-        // null-terminated C string.  We immediately call dlclose.
+        // SAFETY: dlopen is a standard POSIX API.
         let handle = unsafe {
             libc::dlopen(
                 name.as_ptr() as *const libc::c_char,
@@ -312,8 +315,8 @@ fn detect_package_manager_install_cmd() -> &'static str {
             format!("/bin/{}", binary),
         ];
         for path in &paths {
-            // SAFETY: access(2) is a standard POSIX API.  F_OK = 0.
             let c_path = std::ffi::CString::new(path.as_str()).unwrap();
+            // SAFETY: access(2) is a standard POSIX API.  F_OK = 0.
             if unsafe { libc::access(c_path.as_ptr(), libc::F_OK) } == 0 {
                 return cmd;
             }
