@@ -1,16 +1,15 @@
 // src/logger/mod.rs
 //! Production logging system for RUBIX
 //!
-//! Features:
 //! - Dual output: JSON file + pretty stderr console
 //! - 30-day automatic log rotation and cleanup
 //! - Windows/Linux compatible paths
 //! - Non-blocking writers (never stalls packet processing)
 //! - Structured JSON for SIEM ingestion
-//! - Eager permission validation on startup
+//! - YAML config integration (rubix.{linux,windows,common}.yaml)
 
 pub mod alert;
-pub use alert::AlertLogger;
+pub use alert::{AlertLogger, CachedTimestamp, RubixConfig, LoggingConfig};
 
 use tracing_appender::non_blocking::{NonBlocking, WorkerGuard};
 use tracing_subscriber::{prelude::*, EnvFilter};
@@ -36,19 +35,16 @@ fn default_log_dir() -> PathBuf {
 
 const LOG_RETENTION_DAYS: u64 = 30;
 
-/// Delete log files older than LOG_RETENTION_DAYS from the given directory.
-/// Only touches files matching *.log patterns.
-/// Non-fatal — errors are printed to stderr, never panic.
 fn cleanup_old_logs(log_dir: &Path) {
     let cutoff = match SystemTime::now()
         .checked_sub(Duration::from_secs(LOG_RETENTION_DAYS * 24 * 60 * 60))
     {
         Some(t) => t,
-        None    => return,
+        None => return,
     };
 
     let entries = match fs::read_dir(log_dir) {
-        Ok(e)  => e,
+        Ok(e) => e,
         Err(e) => {
             eprintln!("[RUBIX] Log cleanup: cannot read dir {:?}: {}", log_dir, e);
             return;
@@ -56,12 +52,10 @@ fn cleanup_old_logs(log_dir: &Path) {
     };
 
     let mut removed = 0u32;
-    let mut freed   = 0u64;
+    let mut freed = 0u64;
 
     for entry in entries.flatten() {
         let path = entry.path();
-
-        // Only clean up log files — never touch configs or other files.
         let is_log = path.extension()
             .map(|e| e == "log")
             .unwrap_or(false)
@@ -72,7 +66,7 @@ fn cleanup_old_logs(log_dir: &Path) {
         }
 
         let modified = match entry.metadata().and_then(|m| m.modified()) {
-            Ok(t)  => t,
+            Ok(t) => t,
             Err(_) => continue,
         };
 
@@ -81,7 +75,7 @@ fn cleanup_old_logs(log_dir: &Path) {
             match fs::remove_file(&path) {
                 Ok(_) => {
                     removed += 1;
-                    freed   += size;
+                    freed += size;
                     tracing::debug!(path = %path.display(), "Removed expired log file");
                 }
                 Err(e) => {
@@ -100,22 +94,14 @@ fn cleanup_old_logs(log_dir: &Path) {
     }
 }
 
-/// Spawn a background task that runs cleanup once at startup,
-/// then repeats every 24 hours.
-///
-/// **Must be called inside an async context** (after tokio::main starts).
-/// Calling it from a synchronous context will panic with "no runtime".
 fn spawn_cleanup_task(log_dir: PathBuf) {
     tokio::spawn(async move {
-        // Run immediately on startup.
         let dir = log_dir.clone();
         tokio::task::spawn_blocking(move || cleanup_old_logs(&dir))
             .await
             .ok();
 
-        // Then every 24 hours.
         let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
-        // Skip the first immediate tick — already ran above.
         interval.tick().await;
 
         loop {
@@ -130,19 +116,16 @@ fn spawn_cleanup_task(log_dir: PathBuf) {
 
 // ── Private helpers ───────────────────────────────────────────────────────────
 
-/// Build a non-blocking daily-rolling file writer.
-/// Files are named: rubix.YYYY-MM-DD.log
-fn build_file_writer(
+fn build_file_writer_with_prefix(
     log_dir: &Path,
+    prefix: &str,
 ) -> Result<(NonBlocking, WorkerGuard), Box<dyn std::error::Error>> {
     validate_write_access(log_dir)?;
-    let file_appender       = tracing_appender::rolling::daily(log_dir, "rubix.log");
+    let file_appender = tracing_appender::rolling::daily(log_dir, prefix);
     let (non_blocking, guard) = tracing_appender::non_blocking(file_appender);
     Ok((non_blocking, guard))
 }
 
-/// Validate that we can write to the log directory.
-/// Creates and removes a test file — surfaces permission errors at startup.
 fn validate_write_access(log_dir: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let test_path = log_dir.join(".rubix_write_test");
     fs::write(&test_path, b"rubix write test")
@@ -154,8 +137,6 @@ fn validate_write_access(log_dir: &Path) -> Result<(), Box<dyn std::error::Error
     Ok(())
 }
 
-/// Build the default log filter.
-/// Respects RUST_LOG env var if set, otherwise uses "info".
 fn default_filter() -> EnvFilter {
     EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| EnvFilter::new("info"))
@@ -163,31 +144,19 @@ fn default_filter() -> EnvFilter {
 
 // ── Logger ────────────────────────────────────────────────────────────────────
 
-/// Holds the non-blocking writer guard.
-///
-/// **Must be bound to a named variable in main() for the entire program lifetime.**
-/// Dropping it flushes and closes the log file.
-///
-/// ```rust
-/// let _logger = Logger::init_dual()?;
-/// _logger.start_cleanup_task(); // must be called inside async context
-/// ```
 pub struct Logger {
-    _guard:  WorkerGuard,
+    _guard: WorkerGuard,
     log_dir: PathBuf,
 }
 
 impl Logger {
-    // ── Public constructors ───────────────────────────────────────────────────
+    // ── Legacy constructors (backward compatible) ───────────────────────────
 
-    /// File-only JSON logging.
-    /// Use this when running as a service with no terminal.
     pub fn init() -> Result<Self, Box<dyn std::error::Error>> {
         let log_dir = default_log_dir();
         fs::create_dir_all(&log_dir)?;
-
-        let (non_blocking, guard) = build_file_writer(&log_dir)?;
-        let filter                = default_filter();
+        let (non_blocking, guard) = build_file_writer_with_prefix(&log_dir, "rubix")?;
+        let filter = default_filter();
 
         let file_layer = tracing_subscriber::fmt::layer()
             .json()
@@ -195,36 +164,19 @@ impl Logger {
             .with_thread_ids(true)
             .with_file(true)
             .with_line_number(true)
-            .with_writer(non_blocking);
+            .with_writer(non_blocking)
+            .with_filter(filter);
 
-        tracing_subscriber::registry()
-            .with(filter)
-            .with(file_layer)
-            .init();
+        tracing_subscriber::registry().with(file_layer).init();
+        AlertLogger::init().map_err(|e| format!("AlertLogger::init failed: {}", e))?;
 
-        AlertLogger::init()
-            .map_err(|e| format!("AlertLogger::init failed: {}", e))?;
-
-        tracing::info!(
-            log_dir        = %log_dir.display(),
-            retention_days = LOG_RETENTION_DAYS,
-            "Logger initialised (file only)"
-        );
-
+        tracing::info!(log_dir = %log_dir.display(), "Logger initialised (file only)");
         Ok(Self { _guard: guard, log_dir })
     }
 
-    /// Console-only logging (pretty, human-readable).
-    ///
-    /// Use for --debug CLI flag or development.
-    /// Writes to stderr so the heartbeat line on stdout is never broken.
-    ///
-    /// Note: AlertLogger is also initialised here so security events are
-    /// written to the alert log files even in console-only mode.
     pub fn init_console() -> Result<(), Box<dyn std::error::Error>> {
         let filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("debug"));
-
         tracing_subscriber::fmt()
             .with_env_filter(filter)
             .with_target(true)
@@ -232,30 +184,17 @@ impl Logger {
             .with_writer(std::io::stderr)
             .pretty()
             .init();
-
-        // Initialise AlertLogger so log_block / log_alert calls from the
-        // packet loop do not silently discard lines when running in console mode.
-        AlertLogger::init()
-            .map_err(|e| format!("AlertLogger::init failed: {}", e))?;
-
+        AlertLogger::init().map_err(|e| format!("AlertLogger::init failed: {}", e))?;
         Ok(())
     }
 
-    /// Dual output: JSON file + pretty stderr console.
-    ///
-    /// Recommended mode for interactive use.
-    /// Console goes to stderr — never interferes with the heartbeat line
-    /// written to stdout.
     pub fn init_dual() -> Result<Self, Box<dyn std::error::Error>> {
         let log_dir = default_log_dir();
         fs::create_dir_all(&log_dir)?;
+        let (non_blocking, guard) = build_file_writer_with_prefix(&log_dir, "rubix")?;
 
-        let (non_blocking, guard) = build_file_writer(&log_dir)?;
-
-        // ── File layer: JSON, full structured detail ───────────────────────────
         let file_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info"));
-
         let file_layer = tracing_subscriber::fmt::layer()
             .json()
             .with_target(true)
@@ -265,12 +204,8 @@ impl Logger {
             .with_writer(non_blocking)
             .with_filter(file_filter);
 
-        // ── Console layer: pretty, concise, stderr ONLY ───────────────────────
-        // stderr guarantees the heartbeat line on stdout is never broken
-        // by a log message appearing mid-line.
         let console_filter = EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| EnvFilter::new("info"));
-
         let console_layer = tracing_subscriber::fmt::layer()
             .pretty()
             .with_target(false)
@@ -285,25 +220,106 @@ impl Logger {
             .with(console_layer)
             .init();
 
-        // Initialise AlertLogger with safe defaults.  main() calls
-        // AlertLogger::init_with_config() shortly after with the real config
-        // values — the double-init guard in AlertLogger makes that a no-op
-        // if this call wins the race, so the config values from main() take
-        // effect when init_with_config is called first (which it is in
-        // production — AlertLogger::init_with_config is called before
-        // Logger::init_dual in main.rs).
-        //
-        // If Logger::init_dual is called first (current production order),
-        // this init() runs with defaults and the subsequent init_with_config
-        // call is a no-op.  To guarantee config values are used, call
-        // AlertLogger::init_with_config before Logger::init_dual in main.rs.
-        AlertLogger::init()
-            .map_err(|e| format!("AlertLogger::init failed: {}", e))?;
+        AlertLogger::init().map_err(|e| format!("AlertLogger::init failed: {}", e))?;
+
+        tracing::info!(log_dir = %log_dir.display(), "Logger initialised (dual: file + console)");
+        Ok(Self { _guard: guard, log_dir })
+    }
+
+    // ── YAML-aware constructors ─────────────────────────────────────────────
+
+    pub fn init_from_yaml<P: AsRef<Path>>(path: P) -> Result<Self, Box<dyn std::error::Error>> {
+        let config = alert::RubixConfig::from_yaml(path)?;
+        Self::init_from_rubix_config(config)
+    }
+
+    pub fn init_auto() -> Result<Self, Box<dyn std::error::Error>> {
+        let config = alert::RubixConfig::load_auto()?;
+        Self::init_from_rubix_config(config)
+    }
+
+    fn init_from_rubix_config(
+        config: alert::RubixConfig,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let logging = &config.logging;
+
+        let log_path = PathBuf::from(&logging.file_path);
+        let log_dir = log_path
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(default_log_dir);
+        let prefix = log_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("rubix");
+
+        fs::create_dir_all(&log_dir)?;
+        let (non_blocking, guard) = build_file_writer_with_prefix(&log_dir, prefix)?;
+
+        let filter = EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| EnvFilter::new(&logging.level));
+
+        let file_layer = if logging.json_format {
+            tracing_subscriber::fmt::layer()
+                .json()
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_file(true)
+                .with_line_number(true)
+                .with_writer(non_blocking)
+                .with_filter(filter.clone())
+                .boxed()
+        } else {
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_thread_ids(false)
+                .with_file(true)
+                .with_line_number(true)
+                .with_writer(non_blocking)
+                .with_filter(filter.clone())
+                .boxed()
+        };
+
+        let registry = tracing_subscriber::registry().with(file_layer);
+
+        if logging.console_output {
+            let console_filter = EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new(&logging.level));
+            let console_layer = tracing_subscriber::fmt::layer()
+                .pretty()
+                .with_target(false)
+                .with_thread_ids(false)
+                .with_file(true)
+                .with_line_number(true)
+                .with_writer(std::io::stderr)
+                .with_filter(console_filter);
+            registry.with(console_layer).init();
+        } else {
+            registry.init();
+        }
+
+        // Pass the already-resolved `log_dir` so alert files (alerts.log,
+        // traffic.log, errors.log) land in the same directory as the tracing
+        // file layer — not the static platform default.
+        AlertLogger::init_with_config_and_rotation(
+            logging.normal_channel_depth,
+            logging.max_file_size_mb,
+            logging.rotation_count as usize,
+            log_dir.clone(),
+        ).map_err(|e| format!("AlertLogger init failed: {}", e))?;
+
+        let _ = alert::LOGGING_CONFIG.set(logging.clone());
 
         tracing::info!(
-            log_dir        = %log_dir.display(),
-            retention_days = LOG_RETENTION_DAYS,
-            "Logger initialised (dual: file + console)"
+            log_dir = %log_dir.display(),
+            prefix = %prefix,
+            level = %logging.level,
+            json_format = logging.json_format,
+            console_output = logging.console_output,
+            channel_depth = logging.normal_channel_depth,
+            max_file_size_mb = logging.max_file_size_mb,
+            rotation_count = logging.rotation_count,
+            "Logger initialised from YAML config"
         );
 
         Ok(Self { _guard: guard, log_dir })
@@ -311,13 +327,6 @@ impl Logger {
 
     // ── Cleanup task ──────────────────────────────────────────────────────────
 
-    /// Start the 30-day log cleanup background task.
-    ///
-    /// **Must be called inside an async context** (after #[tokio::main] starts).
-    /// Calling from a synchronous context will panic.
-    ///
-    /// Runs once immediately at startup, then every 24 hours.
-    /// Safe to call multiple times — each call spawns one independent task.
     pub fn start_cleanup_task(&self) {
         spawn_cleanup_task(self.log_dir.clone());
     }
@@ -325,7 +334,6 @@ impl Logger {
 
 impl Drop for Logger {
     fn drop(&mut self) {
-        // WorkerGuard flushes and closes the log file on drop.
         tracing::debug!("Logger shutting down — flushing log buffers");
     }
 }

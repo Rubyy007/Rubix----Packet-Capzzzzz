@@ -8,6 +8,8 @@
 //! FIX-E — Process table blink fixed (total_* fields in snapshot).
 //! FIX-F — Pre-flight checks (privilege + Npcap/libpcap) before any init.
 //! FIX-G — Tracing subscriber set to WARN level — no debug noise at startup.
+//! FIX-H — Logger init unified: single YAML parse drives both tracing
+//!         subscriber AND AlertLogger channel (no hardcoded defaults).
 
 mod preflight;   // FIX-F: must be declared before use in main()
 mod types;
@@ -362,40 +364,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     //
     // MUST be the first thing that runs — before terminal detection, before
     // the logger, before tokio tasks, before any OS resource is opened.
-    //
-    // If privilege or Npcap/libpcap is missing, preflight::run() prints a
-    // clear human-readable error with exact install instructions and exits
-    // with code 1.  The process never reaches the next line in that case.
     preflight::run();
 
     // ── Terminal capability detection ─────────────────────────────────────────
     let term_caps = detect_and_init_terminal();
 
-    // ── FIX-G: Logger — WARN level only ──────────────────────────────────────
+    // ── FIX-H: Unified YAML-aware logger init ────────────────────────────────
     //
-    // Previously the logger used the default INFO level which flooded the
-    // terminal with dozens of startup lines (config paths, rule counts, IP
-    // sets, interface names, filter strings, etc.).  At production level the
-    // operator only needs to see warnings and errors — the banner carries all
-    // the human-readable startup information.
+    // One call parses the platform YAML (rubix.linux.yaml / rubix.windows.yaml)
+    // and configures BOTH the tracing subscriber (level, file_path, json_format,
+    // console_output) AND the AlertLogger channel (normal_channel_depth,
+    // max_file_size_mb, rotation_count).  No hardcoded defaults, no init race.
     //
-    // The RUBIX_LOG environment variable overrides this if the operator wants
-    // more detail:
-    //   RUBIX_LOG=info ./rubix    — restore INFO output
-    //   RUBIX_LOG=debug ./rubix   — full debug output
-    let _logger = logger::Logger::init_dual()?;
+    // Searches, in order:
+    //   1. configs/rubix.{linux,windows}.yaml  (platform-specific)
+    //   2. configs/rubix.common.yaml            (fallback)
+    //   3. RUBIX_CONFIG env var               (override)
+    let configs_dir = resolve_configs_dir();
+    let platform_yaml = configs_dir.join(format!("rubix.{}.yaml", OS_NAME));
+    let _logger = if platform_yaml.exists() {
+        logger::Logger::init_from_yaml(&platform_yaml)?
+    } else {
+        logger::Logger::init_auto()?
+    };
     _logger.start_cleanup_task();
 
-    let start_time  = Instant::now();
-    let configs_dir = resolve_configs_dir();
+    let start_time = Instant::now();
 
+    // ── Load runtime config (rules, capture, export, etc.) ────────────────────
     let config_loader = ConfigLoader::load(&configs_dir, OS_NAME)?;
     let config        = config_loader.get();
 
-    AlertLogger::init_with_config(
-        config.logging.normal_channel_depth,
-        config.logging.max_file_size_mb,
-    )?;
+    // AlertLogger already initialised by Logger::init_from_yaml above.
+    // Just start the 1 ms timestamp refresh task.
     AlertLogger::start_timestamp_refresh();
 
     let log_normal:            bool  = config.logging.log_normal_traffic;

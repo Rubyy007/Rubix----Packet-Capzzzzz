@@ -5,7 +5,7 @@ edition      = "2021"
 authors      = ["RUBIX - Manik"]
 description  = "Enterprise-Grade Network Defense Engine with Process Attribution"
 license      = "MIT OR Apache-2.0"
-repository   = "https://github.com/rubix/rubix"
+repository   = "https://github.com/Rubyy007/Rubix----Packet-Capzzzzz"
 rust-version = "1.70"
 
 [[bin]]

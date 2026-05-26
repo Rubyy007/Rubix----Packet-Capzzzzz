@@ -20,27 +20,12 @@ pub struct RubixConfig {
     pub snaplen: u32,
     pub bpf_filter: Option<String>,
 
-    /// Additional CIDR ranges to treat as fully trusted — traffic from these
-    /// addresses is silently ignored by the threat detector.
-    ///
-    /// YAML example:
-    ///   trusted_cidrs:
-    ///     - "100.64.0.0/10"   # Tailscale / WireGuard
-    ///     - "203.0.113.0/24"  # your lab subnet
-    ///
-    /// Invalid CIDR strings are logged as warnings and skipped.
     #[serde(default)]
     pub trusted_cidrs: Vec<String>,
 
-    /// Export pipeline — ships threat/block/alert events to external systems.
-    /// Disabled by default (zero overhead when not configured).
     #[serde(default)]
     pub export: ExportConfig,
 
-    /// HTTP dashboard server.
-    /// Serves the live web UI and REST API on a configurable port.
-    /// Zero fast-path impact — runs in its own async task, reads LiveStats
-    /// via shared read lock only.
     #[serde(default)]
     pub dashboard: DashboardConfig,
 
@@ -75,36 +60,14 @@ impl fmt::Display for OperationMode {
 
 // ── Dashboard ─────────────────────────────────────────────────────────────────
 
-/// HTTP dashboard configuration.
-///
-/// YAML example:
-///   dashboard:
-///     enabled: true
-///     host: "127.0.0.1"   # loopback only — safe default
-///     port: 7878
-///
-/// Security notes:
-///   A cryptographically random 256-bit token is generated at every engine
-///   start using OsRng.  It is printed ONCE to the terminal and rotates on
-///   every restart.  It is never read from config and never written to disk.
-///   To expose beyond loopback, set host: "0.0.0.0" — the token is still
-///   required for every request regardless of host setting.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DashboardConfig {
-    /// Start the HTTP dashboard on engine boot.  Default: true.
     #[serde(default = "default_true")]
     pub enabled: bool,
-
-    /// Interface address to bind.
-    /// "127.0.0.1" → loopback only — safe default.
-    /// "0.0.0.0"   → all interfaces — token auth still required.
     #[serde(default = "default_dashboard_host")]
     pub host: String,
-
-    /// TCP port for the dashboard HTTP server.  Default: 7878.
     #[serde(default = "default_dashboard_port")]
     pub port: u16,
-
 }
 
 impl Default for DashboardConfig {
@@ -195,19 +158,15 @@ pub struct LoggingConfig {
     #[serde(default = "default_true")]
     pub console_output: bool,
 
-    /// Enable logging of allowed (normal) traffic.
     #[serde(default)]
     pub log_normal_traffic: bool,
 
-    /// Log 1-in-N allowed packets.  1 = every packet, 100 = 1%.
     #[serde(default = "default_normal_sample_divisor")]
     pub normal_sample_divisor: u64,
 
-    /// Maximum entries in the in-memory normal-traffic ring shown by the CLI.
     #[serde(default = "default_normal_ring_capacity")]
     pub normal_ring_capacity: usize,
 
-    /// Channel depth for the async normal-traffic file writer.
     #[serde(default = "default_normal_channel_depth")]
     pub normal_channel_depth: usize,
 }
@@ -243,14 +202,36 @@ fn default_rotation_count()        -> u32    { 5 }
 fn default_normal_sample_divisor() -> u64    { 100 }
 fn default_normal_ring_capacity()  -> usize  { 200 }
 fn default_normal_channel_depth()  -> usize  { 4096 }
-fn default_dashboard_host()        -> String { "127.0.0.1".to_string() }  // Fix 1: loopback default
+fn default_dashboard_host()        -> String { "127.0.0.1".to_string() }
 fn default_dashboard_port()        -> u16    { 7878 }
 
+/// Resolve the default log file path at runtime from environment variables.
+///
+/// Windows: reads %PROGRAMDATA% (typically C:\ProgramData but never assumed).
+///          Falls back to "logs\rubix.log" relative to cwd if the env var
+///          is unset (unusual but possible in minimal service environments).
+///
+/// Linux:   /var/log/rubix/rubix.log — standard FHS location.
+///          This is a compile-time constant; no env var equivalent exists.
+///
+/// This function is only called when the YAML config has no logging.file_path
+/// key.  In normal operation the YAML always provides this value.
 fn default_log_path() -> PathBuf {
     #[cfg(target_os = "windows")]
-    return PathBuf::from(r"C:\ProgramData\rubix\rubix.log");
+    {
+        let base = std::env::var("PROGRAMDATA")
+            .unwrap_or_else(|_| {
+                // PROGRAMDATA unset: fall back to cwd-relative path.
+                // Better than assuming C:\ which may not exist or be
+                // writable in all Windows configurations.
+                "logs".to_string()
+            });
+        PathBuf::from(base).join("rubix").join("logs").join("rubix.log")
+    }
     #[cfg(not(target_os = "windows"))]
-    return PathBuf::from("/var/log/rubix/rubix.log");
+    {
+        PathBuf::from("/var/log/rubix/rubix.log")
+    }
 }
 
 // ── Top-level default ─────────────────────────────────────────────────────────
